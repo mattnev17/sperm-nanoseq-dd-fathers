@@ -1,0 +1,3 @@
+source	driverCount	otherCount	mosaicCount	n_samples	totalVAF	vafType	vafProp	count
+Controls	188	452	0	36	1.143640565	Rare (known driver)	0.27299859374960167	188
+Controls	188	452	0	36	1.143640565	Rare (other)	0.7270014062503982	452

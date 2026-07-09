@@ -1,0 +1,3113 @@
+---
+title: "DDfathers_figures"
+author: "Matt Neville"
+date: "09/07/2026"
+output: html_document
+---
+
+## a) Prep
+### Paths
+```{r paths}
+# All input files needed to run this notebook live in ./data
+dataPath <- "data/"
+# All figures produced by this notebook are written to ./output
+outputPath <- "output/"
+dir.create(outputPath, showWarnings = FALSE)
+```
+
+### Libraries
+```{r libraries}
+library(scales)
+library(readxl)
+library(ggrepel)
+library(patchwork)
+library(grid)
+library(ggpubr)
+library(png)
+library(tidyverse)
+```
+
+### Sperm data
+```{r samples}
+
+# Combined Table S1-S10 workbook. Table S6 (Sperm Samples) and Table S8 (Sperm Vars)
+supTables_list <- excel_sheets(paste0(dataPath, "Supplementary_Tables.xlsx")) |>
+  set_names() |>
+  map(~ read_xlsx(paste0(dataPath, "Supplementary_Tables.xlsx"), sheet = .x))
+
+# Per-sample sperm metadata and mutation burdens (Table S6 SpermSamples).
+spermSamplesFiltered <- supTables_list[["Table S6 SpermSamples"]] |>
+  mutate(Sample_PD_ID = paste0(PD_ID, "_tds0001")) |>
+  mutate(dataset = Cohort)
+
+# Targeted variants: derived from Table S8 (Sperm Vars)
+spermVariants <- supTables_list[["Table S8 SpermVars"]] |>
+  mutate(Sample_PD_ID = paste0(PD_ID, "_tds0001")) |>
+  rename(start = start_hg19, csq = VEP_csq, IMPACT = VEP_IMPACT,
+         TIMES_CALLED = DUPLEX_MUT, PHEN = ClinVar_CLNDN, CLNSIG = ClinVar_CLNSIG,
+         CLNSIGCONF = ClinVar_CLNSIGCONF) |>
+  mutate(class = if_else(TYPE == "snv", "snv", "indel"))
+
+# Per-family diagnostic DNM calls, with duplex and BAM support (Table S4 DiagDNMs).
+diagnosticVarsCalls <- supTables_list[["Table S4 DiagDNMs"]] |>
+  rename(duplexCalls = sperm_duplexCalls, duplexCov = sperm_duplexCov, duplexVAF = sperm_duplexVAF,
+         BAM_MUT = sperm_BAM_calls, BAM_COV = sperm_BAM_cov, BAM_VAF = sperm_BAM_VAF) |>
+  mutate(varLabel = if_else(coalesce(duplexCalls, 0) > 0, gene, ""))
+
+table(spermVariants$TYPE)
+
+# Note: "German"/"germanPanel" (variable and chunk names, filter strings,
+# tukGermanPanelVafSums.tsv) refers to the DD-father cohort throughout - as
+# opposed to Apert fathers or TwinsUK Controls.
+
+# Colour palette
+dataset_colours <- c("DD fathers" = "#ef8a62",
+                     "Controls" = "#67a9cf",
+                     "Apert fathers" = "#7fbf7b",
+                    "DD fathers & Controls" = "#654E4E",
+                    "NS" = "grey60",
+                    "Trio DNMs" = "#666A86")
+
+
+```
+
+### Trio data
+```{r dnms}
+
+# Trio de novo mutation calls, including parent-of-origin phase (Table S2 DNMs).
+trioDNM_Vars <- supTables_list[["Table S2 DNMs"]] |>
+  rename(start = start_hg19, PD_ID = PD_ID_Proband, IMPACT = VEP_IMPACT)
+
+table(trioDNM_Vars$phase)
+dim(trioDNM_Vars)[1]
+dim(trioDNM_Vars |> filter(ref %in% c("A", "T", "C", "G") & alt %in% c("A", "T", "C", "G")))[1]
+
+# Trinucleotide-context counts of trio DNMs, for the mutational signature analysis (computed in DDfathers_processing.Rmd, Signatures section).
+trinucDNMs <- read_tsv(paste0(dataPath, "trinucDNMs.tsv"), col_types = cols())
+sum(trinucDNMs$dnmCount)
+
+
+# Trio-level DNM burdens and covariates for DD-father families (Table S3 Trios).
+trioBurdens <- supTables_list[["Table S3 Trios"]] |>
+  filter(Cohort == "DD fathers") |>
+  mutate(dataset = "Trio DNMs") |>
+  rename(PD_ID = PD_ID_Proband, Pat_Age_at_birth = Pat_age_at_birth, Mat_Age_at_birth = Mat_age_at_birth,
+         MEDIAN_COVERAGE = Proband_median_cov, Pat_seq_x = Pat_median_cov, Mat_seq_x = Mat_median_cov,
+         sample.median.0.3vaf = DNM_0.3_medianVAF)
+mean(trioBurdens$Pat_Age_at_birth)
+mean(trioBurdens$Mat_Age_at_birth)
+median(trioBurdens$MEDIAN_COVERAGE)
+
+# Sample overlap between sperm + Trios
+dim(spermSamplesFiltered |> filter(dataset == "DD fathers" & FAM_ID %in% trioBurdens$FAM_ID))[1]
+
+# Trio-level DNM burdens for the SFHS control cohort (Table S3 Trios, ControlTrios rows).
+trioControlBurdens <- supTables_list[["Table S3 Trios"]] |>
+  filter(Cohort == "ControlTrios") |>
+  mutate(dataset = "Controls") |>
+  rename(Pat_Age_at_birth = Pat_age_at_birth) |>
+  mutate(Indel_DNMs_0.3VAF = coalesce(Indel_DNMs_0.3VAF, 0))
+mean(trioControlBurdens$Pat_Age_at_birth)
+range(trioControlBurdens$Pat_Age_at_birth)
+sd(trioControlBurdens$Pat_Age_at_birth)
+
+mean(trioBurdens$Mat_Age_at_birth)
+
+trioSigs <- trioBurdens |> 
+  summarize(SBS1 = sum(SBS1), SBS5 = sum(SBS5))
+```
+
+### Stats
+```{r sampleStats}
+statsVars <- spermVariants |> filter(str_detect(Sample_PD_ID, "PD6")) |> 
+  mutate(coding = if_else(csq %in% c("missense", "synonymous", "stop_lost", "start_lost", "splice_acceptor", "splice_donor", "stop_gained", "inframe_insertion", "inframe_deletion", "coding_sequence"), "coding region", "non-coding"))
+print(paste("Total targeted vars:", dim(statsVars)[1]))
+table(statsVars |> pull(coding))
+
+#VAFs
+dim(statsVars |> filter(TIMES_CALLED == 1))[1]/dim(statsVars)[1]
+dim(statsVars |> filter(TIMES_CALLED > 1 & BAM_VAF>0.01))[1]/dim(statsVars)[1]
+
+mean(spermVariants |> filter(str_detect(Sample_PD_ID, "PD6")) |> pull(DUPLEX_COV))
+mean(spermVariants |> filter(str_detect(Sample_PD_ID, "PD6")) |> pull(BAM_COV))
+
+statsVarsApert <- spermVariants |> filter(str_detect(Sample_PD_ID, "PD5")) |> 
+  mutate(coding = if_else(csq %in% c("missense", "synonymous", "stop_lost", "start_lost", "splice_acceptor", "splice_donor", "stop_gained", "inframe_insertion", "inframe_deletion", "coding_sequence"), "coding region", "non-coding"))
+print(paste("Total targeted vars:", dim(statsVarsApert)[1]))
+
+targetVarsStats <- diagnosticVarsCalls |>
+  filter(Cohort == "DD fathers", duplexCov > 100) |>
+  mutate(
+    excl95_pct = 100 * (1 - 0.05^(1 / duplexCov))
+  )
+```
+
+### TwinsUK controlled-access data
+```{r twinsUKAvailability}
+# TwinsUK sperm NanoSeq data (Neville et al.) is under TwinsUK's controlled-access
+# policy - see README for how to request it. If you have that access and have
+# placed the individual-level TwinsUK files in data/, this notebook reproduces the
+# manuscript figures exactly (DD fathers + Apert fathers + TwinsUK Controls).
+# Otherwise it falls back to DD father (+ Apert father) data only, drawing the
+# TwinsUK trend/fit lines from pre-computed aggregate summaries
+# (data/twinsUK_*Fits.tsv, data/twinsUK_exomePanelCorrection_stats.tsv) where
+# available - these contain only fitted Age-grid values and reported statistics,
+# never individual TwinsUK data points.
+twinsUKDataAvailable <- file.exists(paste0(dataPath, "tukGermanPanelVafSums.tsv"))
+
+# Matches the grid the fits were saved on (by 1 year of age)
+age_grid_fine <- tibble(Age = seq(10, 80, by = 1))
+
+# Predict from a saved Age-grid fit table (columns: model, Age, fit, ci_lo, ci_hi)
+# at arbitrary ages via linear interpolation - exact for the simple lm() fits
+# saved here, and a good approximation for the quasibinomial smooth since the
+# saved grid is by single year of age. rule = 2 extrapolates using the nearest
+# boundary value instead of returning NA - needed because ages back-inferred to
+# conception (Age - paternalAgeGap) can fall outside the observed TwinsUK range.
+predict_from_fit_table <- function(fitTable, modelName, ages) {
+  sub <- fitTable |> filter(model == modelName) |> arrange(Age)
+  tibble(
+    Age = ages,
+    fit = approx(sub$Age, sub$fit, xout = ages, rule = 2)$y,
+    ci_lo = approx(sub$Age, sub$ci_lo, xout = ages, rule = 2)$y,
+    ci_hi = approx(sub$Age, sub$ci_hi, xout = ages, rule = 2)$y
+  )
+}
+```
+
+### SCN1A-ascertained families
+```{r scn1a_ids}
+# Identify SCN1A-ascertained FAM_IDs and their corresponding sperm Sample_PD_IDs.
+# These are families enrolled specifically because of an SCN1A diagnostic variant, and are excluded in some analyses
+
+scn1a_fam_ids   <- diagnosticVarsCalls |>
+  filter(ANALYSIS_PERFORMED == "SCN1A ascertained") |>
+  pull(FAM_ID) |> unique()
+
+scn1a_sperm_ids <- spermSamplesFiltered |>
+  filter(FAM_ID %in% scn1a_fam_ids) |>
+  pull(Sample_PD_ID)
+
+cat("SCN1A-ascertained families (n =", length(scn1a_fam_ids), "):", paste(scn1a_fam_ids, collapse = ", "), "\n")
+cat("Corresponding sperm samples (n =", length(scn1a_sperm_ids), "):", paste(scn1a_sperm_ids, collapse = ", "), "\n")
+```
+
+## b) Burdens
+### Trio Burdens
+```{r triBurden, fig.height = 5, fig.width = 10}
+# Grid of ages to predict over
+age_grid <- tibble(Pat_Age_at_birth = seq(20, 65, by = 5))
+
+# Fit linear model and predict across age grid
+fit_model_and_predict_dnms <- function(df, age_grid) {
+  model <- lm(DNM ~ Pat_Age_at_birth, data = df)
+  
+  pred_mat <- sapply(age_grid$Pat_Age_at_birth, function(a) {
+    predict(model, newdata = tibble(Pat_Age_at_birth = a), se.fit = TRUE, interval = "confidence", level = 0.95)$fit[1:3]
+  })
+  
+  pred_df <- tibble(
+    Pat_Age_at_birth = age_grid$Pat_Age_at_birth,
+    fit = pred_mat[1,],
+    ci_lo = pred_mat[2,],
+    ci_hi = pred_mat[3,]
+  )
+  
+  list(model = model, predictions = pred_df)
+}
+
+dnm_data_long <- trioBurdens |> 
+  bind_rows(trioControlBurdens) |> 
+  select(dataset, Pat_Age_at_birth, SNP_DNMs_0.3VAF, Indel_DNMs_0.3VAF) |> 
+  rename(snv = SNP_DNMs_0.3VAF, indel = Indel_DNMs_0.3VAF) |> 
+  pivot_longer(cols = c(snv, indel), names_to = "class", values_to = "DNM") |> 
+  drop_na(DNM) |> 
+  mutate(dataset = factor(dataset, levels = c("Controls", "Trio DNMs")))
+
+all_preds <- dnm_data_long |> 
+  group_by(dataset, class) |> 
+  group_map(~ {
+    result <- fit_model_and_predict_dnms(.x, age_grid)
+    
+    result$predictions |> 
+      mutate(
+        dataset = .y$dataset,
+        class = .y$class
+      )
+  }) |> 
+  bind_rows() |> 
+    mutate(dataset = factor(dataset, levels = c("Trio DNMs", "Controls")))
+
+# Filter only Trio DNMs, for SNVs and indels separately
+dnm_trio_snv <- dnm_data_long |> filter(dataset == "Trio DNMs", class == "snv")
+dnm_trio_indel <- dnm_data_long |> filter(dataset == "Trio DNMs", class == "indel")
+
+# Fit models
+lm_snv_trio <- lm(DNM ~ Pat_Age_at_birth, data = dnm_trio_snv)
+lm_indel_trio <- lm(DNM ~ Pat_Age_at_birth, data = dnm_trio_indel)
+
+# Extract slope + 95% CI for Trio SNVs
+slope_snv <- coef(lm_snv_trio)["Pat_Age_at_birth"]
+ci_snv <- confint(lm_snv_trio)["Pat_Age_at_birth", ]
+
+# Extract slope + 95% CI for Trio Indels
+slope_indel <- coef(lm_indel_trio)["Pat_Age_at_birth"]
+ci_indel <- confint(lm_indel_trio)["Pat_Age_at_birth", ]
+
+# Print summary
+cat("=== Trio DNMs (SNVs) ===\n")
+cat("Slope:", signif(slope_snv, 3), "\n")
+cat("95% CI:", signif(ci_snv[1], 3), "to", signif(ci_snv[2], 3), "\n\n")
+
+cat("=== Trio DNMs (Indels) ===\n")
+cat("Slope:", signif(slope_indel, 3), "\n")
+cat("95% CI:", signif(ci_indel[1], 3), "to", signif(ci_indel[2], 3), "\n")
+
+# Fit interaction model for SNVs
+lm_snv_interaction <- lm(DNM ~ Pat_Age_at_birth * dataset, data = dnm_data_long |> filter(class == "snv"))
+
+
+# Fit interaction model for Indels
+lm_indel_interaction <- lm(DNM ~ Pat_Age_at_birth * dataset, data = dnm_data_long |> filter(class == "indel"))
+
+
+# Extract p-values for interaction term (slope difference)
+pval_snv_interaction <- summary(lm_snv_interaction)$coefficients["Pat_Age_at_birth:datasetTrio DNMs", "Pr(>|t|)"]
+pval_indel_interaction <- summary(lm_indel_interaction)$coefficients["Pat_Age_at_birth:datasetTrio DNMs", "Pr(>|t|)"]
+
+cat("\n=== Interaction test ===\n")
+cat("P-value for SNV slope difference (Trio vs Control):", signif(pval_snv_interaction, 3), "\n")
+cat("P-value for Indel slope difference (Trio vs Control):", signif(pval_indel_interaction, 3), "\n")
+
+# SNV panel using model predictions
+snv_DNM_plot <- ggplot(trioBurdens |> bind_rows(trioControlBurdens) |> mutate(dataset = factor(dataset, levels = c("Trio DNMs", "Controls"))), 
+                       aes(x = Pat_Age_at_birth, y = SNP_DNMs_0.3VAF, fill = dataset)) +
+  geom_point(pch = 21, size = 3.5, stroke = 0.25, colour = "white") +
+  geom_ribbon(
+    data = all_preds |> filter(class == "snv"),
+    aes(x = Pat_Age_at_birth, ymin = ci_lo, ymax = ci_hi, fill = dataset),
+    inherit.aes = FALSE, alpha = 0.25
+  ) +
+  geom_line(
+    data = all_preds |> filter(class == "snv"),
+    aes(x = Pat_Age_at_birth, y = fit, colour = dataset),
+    inherit.aes = FALSE, linewidth = 1.1
+  ) +
+  xlim(c(20, 75)) +
+  ylim(c(0, NA)) +
+  scale_fill_manual(values = dataset_colours, guide = guide_legend(title = NULL)) +
+  scale_colour_manual(values = dataset_colours, guide = guide_legend(title = NULL)) +
+  xlab("Paternal age") +
+  ylab("De novo SNV count") +
+  theme_pubr() +
+  theme(
+    text = element_text(size = 16),
+    legend.position = c(0.4, 0.4),
+    legend.justification = c("left", "top"),
+    legend.background = element_blank(),
+    legend.key.height = unit(1.2, "lines"),
+    legend.key.width = unit(1.2, "lines")
+  )
+
+# Indel panel using model predictions
+indel_DNM_plot <- ggplot(trioBurdens |> bind_rows(trioControlBurdens) |> mutate(dataset = factor(dataset, levels = c("Trio DNMs", "Controls"))), 
+                         aes(x = Pat_Age_at_birth, y = Indel_DNMs_0.3VAF, fill = dataset)) +
+  geom_point(pch = 21, size = 3.5, stroke = 0.25, colour = "white") +
+  geom_ribbon(
+    data = all_preds |> filter(class == "indel"),
+    aes(x = Pat_Age_at_birth, ymin = ci_lo, ymax = ci_hi, fill = dataset),
+    inherit.aes = FALSE, alpha = 0.25
+  ) +
+  geom_line(
+    data = all_preds |> filter(class == "indel"),
+    aes(x = Pat_Age_at_birth, y = fit, colour = dataset),
+    inherit.aes = FALSE, linewidth = 1.1
+  ) +
+  xlim(c(20, 75)) +
+  ylim(c(0, NA)) +
+  scale_fill_manual(values = dataset_colours, guide = guide_legend(title = NULL)) +
+  scale_colour_manual(values = dataset_colours, guide = guide_legend(title = NULL)) +
+  xlab("Paternal age") +
+  ylab("De novo indel count") +
+  theme_pubr() +
+  theme(
+    text = element_text(size = 16),
+    legend.position = "none",
+    legend.justification = c("left", "top"),
+    legend.background = element_blank(),
+    legend.key.height = unit(1.2, "lines"),
+    legend.key.width = unit(1.2, "lines")
+  )
+
+# Combine plots
+snv_DNM_plot + indel_DNM_plot
+```
+
+### Sperm Burdens 
+#### i) Prep mutations
+```{r targBurden, fig.height=5, fig.width=8}
+
+# --- 1. Mutations ---
+spermVariants1 <- spermVariants |>
+  filter(BAM_VAF < 0.01, DUPLEX_VAF < 0.1)
+
+# TwinsUK sperm NanoSeq data (individual-level mutation calls, coverage and
+# burdens from the TwinsUK sperm control cohort) is under TwinsUK's
+# controlled-access policy - see README. When twinsUKDataAvailable, mutRegionCovs
+# below includes the TwinsUK "Controls" group exactly as in the manuscript.
+# Otherwise it's DD fathers + Apert fathers only; the TwinsUK trend line is added
+# back into the model predictions (not the raw points) further down from a
+# pre-computed aggregate fit.
+if (twinsUKDataAvailable) {
+  twinsUKTargVars1 <- read_tsv(
+    paste0(dataPath, "twinsUK_analysisTargVars.tsv"),
+    col_types = cols()
+  ) |>
+    filter(nanoseq == "Exome") |>
+    select(-meth)
+}
+
+# Mutations per region
+germanMuts <- bind_rows(
+  spermVariants1 |> mutate(region = "all"),
+  spermVariants1 |> mutate(region = "germanPanel"),
+  spermVariants1 |>
+    left_join(
+      read_tsv(paste0(dataPath, "exclDrivers.txt"),
+               col_types = 'cdc') |> distinct(),
+      by = join_by(chr, start)
+    ) |> drop_na(region)
+) |>
+  mutate(dataset = "DD fathers")
+
+if (twinsUKDataAvailable) {
+  twinsMuts <- bind_rows(
+    twinsUKTargVars1 |> filter(BAM_VAF < 0.01) |> mutate(region = "all"),
+    twinsUKTargVars1 |>
+      left_join(
+        bind_rows(
+          read_tsv(paste0(dataPath, "twinsUK_coding.txt"),
+                   col_types = cols(), col_names = c("chr", "start", "region")),
+          read_tsv(paste0(dataPath, "twinsUK_nonCoding.txt"),
+                   col_types = cols(), col_names = c("chr", "start", "region"))
+        ) |> mutate(region = "germanPanel") |> distinct(),
+        by = join_by(chr, start)
+      ) |> drop_na(region),
+    twinsUKTargVars1 |>
+      left_join(
+        read_tsv(paste0(dataPath, "twinsUK_exclDrivers.txt"),
+                 col_types = cols(), col_names = c("chr", "start", "region")) |> distinct(),
+        by = join_by(chr, start)
+      ) |> drop_na(region)
+  ) |>
+    mutate(dataset = "Controls")
+}
+
+mutRegionMuts <- (if (twinsUKDataAvailable) bind_rows(germanMuts, twinsMuts) else germanMuts) |>
+  group_by(Sample_PD_ID, class, region, dataset) |>
+  summarise(muts = sum(TIMES_CALLED), .groups = "drop") |>
+  complete(nesting(Sample_PD_ID, dataset), class, region, fill = list(muts = 0))
+
+# --- 2. Coverage ---
+regions <- c("all", "germanPanel", "exclDrivers")
+
+germanCov <- bind_rows(
+  read_tsv(paste0(dataPath, "mutRegionsCovs.tsv"),
+           col_types = cols()),
+  spermSamplesFiltered |> select(Sample_PD_ID, total = total_duplex_bp_cov) |> mutate(region = "all"),
+  spermSamplesFiltered |> select(Sample_PD_ID, total = total_duplex_bp_cov) |> mutate(region = "germanPanel")
+)
+
+if (twinsUKDataAvailable) {
+  twinsCov_raw <- read_tsv(
+    paste0(dataPath, "twinsUK_mutRegionsCovs.tsv"),
+    col_types = cols(), col_names = c("total", "Sample_PD_ID", "region")
+  )
+
+  twinsCov <- bind_rows(
+    twinsCov_raw,
+    twinsCov_raw |>
+      filter(region %in% c("coding", "nonCoding")) |>
+      group_by(Sample_PD_ID) |>
+      summarise(total = sum(total), .groups = "drop") |>
+      mutate(region = "germanPanel")
+  )
+
+  burdenAll <- read_tsv(
+    paste0(dataPath, "twinsUK_burdensFiltered_exome.tsv"),
+    col_types = cols()
+  ) |>
+    select(Sample_PD_ID, total) |>
+    mutate(region = "all")
+}
+
+mutRegionCovs_base <- (if (twinsUKDataAvailable) bind_rows(germanCov, twinsCov, burdenAll) else germanCov) |>
+  left_join(mutRegionMuts, by = join_by(Sample_PD_ID, region)) |>
+  drop_na() |>
+  mutate(burden = muts / total)
+
+
+# --- 3. Add metadata ---
+# TwinsUK sample metadata (age at sampling) is part of the same controlled-access
+# dataset - see note above. sampleMeta below is DD fathers + Apert fathers only
+# unless twinsUKDataAvailable.
+sampleMeta <- spermSamplesFiltered |> select(Sample_PD_ID, Age)
+if (twinsUKDataAvailable) {
+  sampleMeta <- bind_rows(
+    sampleMeta,
+    read_tsv(paste0(dataPath, "targetedSamplesFiltered.tsv"), col_types = cols()) |>
+      select(Sample_PD_ID, Age = age_at_sampling)
+  )
+}
+
+mutRegionCovs <- mutRegionCovs_base |>
+  left_join(sampleMeta, by = "Sample_PD_ID") |>
+  mutate(region = fct_relevel(region, regions)) |>
+  mutate(dataset = if_else(str_detect(Sample_PD_ID, "PD59"), "Apert fathers", dataset))
+
+```
+
+#### ii) Linear models
+```{r targBurdenModels, fig.height=5, fig.width=8}
+# -- Label/summary helpers for lm() models --
+
+metricsText_lm <- function(model, roundTo = 2) {
+  slope <- coef(model)[2]
+  intercept <- coef(model)[1]
+  conf <- confint(model)
+  cat(paste0("Slope of ", round(slope, roundTo), " * Age (95% CI: ",
+             round(conf[2,1], roundTo), "–", round(conf[2,2], roundTo), ")\n"))
+  cat(paste0("Intercept of ", round(intercept, roundTo), " (95% CI: ",
+             round(conf[1,1], roundTo), "–", round(conf[1,2], roundTo), ")\n"))
+}
+
+metricsLabel_lm <- function(model, roundTo = 2) {
+  sprintf("%0.0f + %.*f × age", coef(model)[1], roundTo, coef(model)[2])
+}
+
+# -- Create grid of ages for prediction --
+ages_grid <- tibble(Age = seq(20, 75, by = 5))
+
+
+# -- Fit a model and return predictions with CI --
+fit_model_and_predict <- function(df, ages = ages_grid$Age) {
+  model <- lm(burden ~ Age, data = df)
+  
+  pred_mat <- sapply(ages, function(a) {
+    predict(model, newdata = tibble(Age = a), se.fit = TRUE, interval = "confidence", level = 0.95)$fit[1:3]
+  })
+  
+  pred_df <- tibble(
+    Age = ages,
+    fit = pred_mat[1,],
+    ci_lo = pred_mat[2,],
+    ci_hi = pred_mat[3,]
+  )
+  
+  list(model = model, predictions = pred_df)
+}
+
+
+# -- Filter and prepare input data --
+mutData <- mutRegionCovs |> 
+  filter(region != "all") |> 
+  mutate(region = as.character(region))
+
+
+# -- Run models and collect predictions + metrics --
+model_outputs <- mutData |> 
+  group_by(class, region, dataset) |> 
+  group_map(~ {
+    result <- fit_model_and_predict(.x)
+    label <- metricsLabel_lm(result$model)
+    
+    predictions <- result$predictions |> mutate(
+      class = .y$class,
+      region = .y$region,
+      dataset = .y$dataset,
+      label = label
+    )
+    
+    metrics <- tibble(
+      class = .y$class,
+      region = .y$region,
+      dataset = .y$dataset,
+      label = label,
+      slope = coef(result$model)[2],
+      intercept = coef(result$model)[1]
+    )
+    
+    list(model = result$model, predictions = predictions, metrics = metrics)
+  })
+
+
+# -- Combine outputs for plotting and summary --
+all_preds <- map_dfr(model_outputs, ~ .x$predictions)
+if (!twinsUKDataAvailable) {
+  # Add the TwinsUK "Controls" trend line back in from the pre-computed
+  # aggregate fit (data/twinsUK_mutRegionFits.tsv - Age grid + fit + CI per
+  # class/region, no individual TwinsUK points) so plots still show it below.
+  all_preds <- bind_rows(all_preds, read_tsv(paste0(dataPath, "twinsUK_mutRegionFits.tsv"), col_types = cols()))
+}
+all_preds <- all_preds |>
+    mutate(dataset = factor(dataset, levels = c("DD fathers", "Apert fathers", "Controls")))
+all_metrics <- map_dfr(model_outputs, ~ .x$metrics)
+
+```
+
+#### iii) Test burden dif
+```{r burdenDif, fig.height=5, fig.width=8}
+compare_slopes_verbose <- function(df, mutation_class) {
+  # Subset by mutation class and region
+  subset_data <- df |> filter(class == mutation_class, region == "germanPanel")
+  
+  # Fit models
+  full_model <- lm(burden ~ Age * dataset, data = subset_data)
+  null_model <- lm(burden ~ Age + dataset, data = subset_data)
+  
+  # Compare models
+  anova_result <- anova(null_model, full_model)
+  interaction_p <- anova_result$`Pr(>F)`[2]
+  
+  # Extract joint slope + CI from null model
+  slope <- coef(null_model)["Age"]
+  ci <- confint(null_model)["Age", ]
+  
+  # Format outputs
+  cat("\n=== Results for", toupper(mutation_class), "(germanPanel) ===\n")
+  cat("P-value for Age × dataset interaction:", signif(interaction_p, 3), "\n")
+  if (!is.na(interaction_p) && interaction_p < 0.05) {
+    cat("⟶ Slopes differ significantly between datasets.\n")
+  } else {
+    cat("⟶ No significant difference in slope between datasets.\n")
+  }
+  cat("Joint slope estimate:", signif(slope, 3), "mutations per year\n")
+  cat("95% CI for joint slope: [", signif(ci[1], 3), "–", signif(ci[2], 3), "]\n\n")
+  
+  # Return values (optional)
+  return(invisible(list(
+    p_value = interaction_p,
+    slope = slope,
+    ci_lower = ci[1],
+    ci_upper = ci[2]
+  )))
+}
+compare_slopes_verbose(mutRegionCovs, "snv")
+compare_slopes_verbose(mutRegionCovs, "indel")
+
+```
+
+#### iv) Plots
+```{r plotBurdens, fig.height=4, fig.width=12}
+
+# Points come from mutRegionCovs (real data only, so no individual TwinsUK
+# points unless twinsUKDataAvailable); the ribbon/line come from all_preds,
+# which always includes the TwinsUK "Controls" trend - either fitted live or
+# read back from the pre-computed aggregate fit (see chunks above).
+pointDatasetLevels <- if (twinsUKDataAvailable) c("DD fathers", "Controls") else c("DD fathers")
+pointDatasetLevelsApert <- if (twinsUKDataAvailable) c("DD fathers", "Apert fathers", "Controls") else c("DD fathers", "Apert fathers")
+
+# SNV panel
+snv_plot <- ggplot(
+  mutRegionCovs |> filter(class == "snv", region == "germanPanel", dataset != "Apert fathers") |>
+    mutate(dataset = factor(dataset, levels = pointDatasetLevels)),
+  aes(x = Age, y = burden, fill = dataset)
+) +
+  geom_point(pch = 21, size = 3.5, stroke = 0.25, colour = "white") +
+  geom_ribbon(
+    data = all_preds |> filter(region == "germanPanel" & class == "snv", dataset != "Apert fathers"),
+    aes(x = Age, ymin = ci_lo, ymax = ci_hi, fill = dataset),
+    inherit.aes = FALSE, alpha = 0.25
+  ) +
+  geom_line(
+    data = all_preds |> filter(region == "germanPanel" & class == "snv", dataset != "Apert fathers"),
+    aes(x = Age, y = fit, colour = dataset),
+    inherit.aes = FALSE, linewidth = 1.1
+  ) +
+  ylim(0,NA) +
+  scale_fill_manual(values = dataset_colours, guide = guide_legend(title = NULL)) +
+  scale_colour_manual(values = dataset_colours, guide = guide_legend(title = NULL)) +
+  xlab("Paternal age") +
+  ylab("Sperm SNVs per bp") +
+  theme_pubr() +
+  theme(
+    text = element_text(size = 16),
+    legend.position = c(0.02, 0.98),
+    legend.justification = c("left", "top"),
+    legend.background = element_blank(),
+    legend.key.height = unit(1.2, "lines"),
+    legend.key.width = unit(1.2, "lines")
+  )
+
+# Indel panel
+indel_plot <- ggplot(
+  mutRegionCovs |> filter(class == "indel", region == "germanPanel", dataset != "Apert fathers")|>
+    mutate(dataset = factor(dataset, levels = pointDatasetLevels)),
+  aes(x = Age, y = burden, fill = dataset)
+) +
+  geom_point(pch = 21, size = 3.5, stroke = 0.25, colour = "white") +
+  geom_ribbon(
+    data = all_preds |> filter(region == "germanPanel" & class == "indel", dataset != "Apert fathers"),
+    aes(x = Age, ymin = ci_lo, ymax = ci_hi, fill = dataset),
+    inherit.aes = FALSE, alpha = 0.25
+  ) +
+  geom_line(
+    data = all_preds |> filter(region == "germanPanel" & class == "indel", dataset != "Apert fathers"),
+    aes(x = Age, y = fit, colour = dataset),
+    inherit.aes = FALSE, linewidth = 1.1
+  ) +
+  scale_fill_manual(values = dataset_colours, guide = guide_legend(title = NULL)) +
+  scale_colour_manual(values = dataset_colours, guide = guide_legend(title = NULL)) +
+  xlab("Paternal age") +
+  ylab("Sperm indels per bp") +
+  theme_pubr() +
+  theme(
+    text = element_text(size = 16),
+    legend.position = "none"
+  )
+
+snv_plot + indel_plot
+
+# SNV panel (DD fathers vs Apert fathers, +TwinsUK Controls if available)
+snv_plotApert <- ggplot(
+  mutRegionCovs |> filter(class == "snv", region == "germanPanel") |>
+    mutate(dataset = factor(dataset, levels = pointDatasetLevelsApert)),
+  aes(x = Age, y = burden, fill = dataset)
+) +
+  geom_point(pch = 21, size = 3.5, stroke = 0.25, colour = "white") +
+  geom_ribbon(
+    data = all_preds |> filter(region == "germanPanel" & class == "snv"),
+    aes(x = Age, ymin = ci_lo, ymax = ci_hi, fill = dataset),
+    inherit.aes = FALSE, alpha = 0.25
+  ) +
+  geom_line(
+    data = all_preds |> filter(region == "germanPanel" & class == "snv"),
+    aes(x = Age, y = fit, colour = dataset),
+    inherit.aes = FALSE, linewidth = 1.1
+  ) +
+  ylim(0,NA) +
+  scale_fill_manual(values = dataset_colours, guide = guide_legend(title = NULL)) +
+  scale_colour_manual(values = dataset_colours, guide = guide_legend(title = NULL)) +
+  xlab("Paternal age") +
+  ylab("Sperm SNVs per bp") +
+  theme_pubr() +
+  theme(
+    text = element_text(size = 16),
+    legend.position = c(0.02, 0.98),
+    legend.justification = c("left", "top"),
+    legend.background = element_blank(),
+    legend.key.height = unit(1.2, "lines"),
+    legend.key.width = unit(1.2, "lines")
+  )
+
+# Indel panel (DD fathers vs Apert fathers, +TwinsUK Controls if available)
+indel_plotApert <- ggplot(
+  mutRegionCovs |> filter(class == "indel", region == "germanPanel")|>
+    mutate(dataset = factor(dataset, levels = pointDatasetLevelsApert)),
+  aes(x = Age, y = burden, fill = dataset)
+) +
+  geom_point(pch = 21, size = 3.5, stroke = 0.25, colour = "white") +
+  geom_ribbon(
+    data = all_preds |> filter(region == "germanPanel" & class == "indel"),
+    aes(x = Age, ymin = ci_lo, ymax = ci_hi, fill = dataset),
+    inherit.aes = FALSE, alpha = 0.25
+  ) +
+  geom_line(
+    data = all_preds |> filter(region == "germanPanel" & class == "indel"),
+    aes(x = Age, y = fit, colour = dataset),
+    inherit.aes = FALSE, linewidth = 1.1
+  ) +
+  scale_fill_manual(values = dataset_colours, guide = guide_legend(title = NULL)) +
+  scale_colour_manual(values = dataset_colours, guide = guide_legend(title = NULL)) +
+  xlab("Paternal age") +
+  ylab("Sperm indels per bp") +
+  theme_pubr() +
+  theme(
+    text = element_text(size = 16),
+    legend.position = "none"
+  )
+
+snv_plotApert + indel_plotApert
+```
+
+### Parental Phase test
+```{r phaseBurden, fig.height=5, fig.width=10}
+
+distinctPhasing <- diagnosticVarsCalls |> 
+  select(FAM_ID, phasing) |> 
+  distinct() |> 
+  group_by(FAM_ID) |> 
+  summarise(
+    phasing = case_when(
+      all(phasing %in% c("paternal", "unknown")) & "paternal" %in% phasing ~ "paternal",
+      all(phasing %in% c("maternal", "unknown")) & "maternal" %in% phasing ~ "maternal",
+      TRUE ~ "unknown"
+    ),
+    .groups = "drop"
+  )
+table(distinctPhasing$phasing)
+
+burdenPhasing <- spermSamplesFiltered |>
+  mutate(burdenCorr = snv_burden_corr_0.01vaf, indelBurden = indel_burden_0.01vaf)|>
+  left_join(distinctPhasing, by = join_by(FAM_ID)) |>
+  mutate(phasing = coalesce(phasing, "unknown"))
+table(burdenPhasing$phasing)
+
+# 1. Filter to samples with phasing: paternal or maternal only
+phasedOnly <- burdenPhasing |> 
+  filter(phasing %in% c("paternal", "maternal")) |> 
+  mutate(phasing = factor(phasing, levels = c("maternal", "paternal")))
+
+# 2. Linear model for SNV burden
+lm_snv_phase <- lm(burdenCorr ~ Age + phasing, data = phasedOnly)
+summary(lm_snv_phase)
+
+# 3. Linear model for indel burden
+lm_indel_phase <- lm(indelBurden ~ Age + phasing, data = phasedOnly)
+summary(lm_indel_phase)
+
+# 4. Extract and report p-values for the phasing term
+pval_snv_phase <- summary(lm_snv_phase)$coefficients["phasingpaternal", "Pr(>|t|)"]
+pval_indel_phase <- summary(lm_indel_phase)$coefficients["phasingpaternal", "Pr(>|t|)"]
+
+cat("P-value for phasing effect (SNV burden):", signif(pval_snv_phase, 3), "\n")
+cat("P-value for phasing effect (Indel burden):", signif(pval_indel_phase, 3), "\n")
+
+p_germanTrioPhasingBurdens <- ggplot(burdenPhasing, aes(x = Age, y = burdenCorr, fill = phasing)) + 
+  geom_point(size=3.5, pch=21, col='white', stroke=0.25) + 
+  geom_smooth(method = "lm") + 
+   theme(text = element_text(size=16)) + 
+  xlab('Age (years)') + 
+  ylab('SNVs per bp') + 
+  labs(fill='Phasing of\ndiagnostic variant') + 
+  theme_pubr() + 
+  ylim(0,NA) +
+  theme(legend.position = "right")
+
+p_germanTrioPhasingBurdens
+
+p_indelPhasingBurden<- ggplot(burdenPhasing, aes(x = Age, y = indelBurden, fill =  phasing)) + 
+  geom_point(size=3.5, pch=21, col='white', stroke=0.25) + 
+  scale_alpha_manual(values = c(1, 1, 0.8), guide = "none") + 
+   theme(text = element_text(size=16)) + 
+  geom_smooth(method = "lm") + 
+  xlab('Age (years)') + 
+  ylab('Indels per bp') + 
+  labs(fill='Phasing of\ndiagnostic variant') + 
+  theme_pubr() + 
+  ylim(0,NA)  +
+  theme(legend.position = "none")
+
+p_indelPhasingBurden
+
+
+```
+
+#### SupFig 2
+```{r supFig2, fig.height=4, fig.width=11}
+
+p_germanTrioPhasingBurdens + p_indelPhasingBurden + plot_layout(guides = "collect") + plot_annotation(tag_levels = "A")  &
+  theme(plot.tag = element_text(size = 14, face = "bold"))
+
+
+pdf(paste0(outputPath, 'SupFig2_phasedBurdens.pdf'), height=4, width=11, onefile = F)
+p_germanTrioPhasingBurdens + p_indelPhasingBurden + plot_layout(guides = "collect") + plot_annotation(tag_levels = "A")  &
+  theme(plot.tag = element_text(size = 14, face = "bold"))
+dev.off()
+
+```
+
+### DNM vs Sperm burdens
+```{r dnmBurden, fig.height=5, fig.width=8}
+
+burdenComp <- spermSamplesFiltered |> select(FAM_ID, burdenCorr = snv_burden_corr_0.01vaf, indelBurden = indel_burden_0.01vaf, spermAge = Age) |>
+  left_join(trioBurdens |> select(FAM_ID, indelDNMs = Indel_DNMs_0.3VAF, snvDNMs = SNP_DNMs_0.3VAF, Pat_Age_at_birth, Mat_Age_at_birth, sample.median.0.3vaf, Proband_seq_x = MEDIAN_COVERAGE, Pat_seq_x, Mat_seq_x), by = join_by(FAM_ID)) |> 
+  drop_na(snvDNMs) |> 
+  mutate(paternalAgeGap = spermAge - Pat_Age_at_birth)
+
+
+# Drop rows with missing QC data
+burdenComp <- burdenComp |> drop_na(sample.median.0.3vaf, Proband_seq_x, Pat_seq_x, Mat_seq_x)
+
+# === SNV ANALYSIS ===
+
+# 1. Raw correlation
+cor_test_snv <- cor.test(burdenComp$burdenCorr, burdenComp$snvDNMs)
+
+# 2. Base model: parental age + QC
+lm_base_snv <- lm(snvDNMs ~ Pat_Age_at_birth + Mat_Age_at_birth +
+                    sample.median.0.3vaf + Proband_seq_x + Pat_seq_x + Mat_seq_x,
+                  data = burdenComp)
+
+# 3. Full model: add sperm burden + age gap
+lm_full_snv <- lm(snvDNMs ~ Pat_Age_at_birth + Mat_Age_at_birth + paternalAgeGap +
+                    sample.median.0.3vaf + Proband_seq_x + Pat_seq_x + Mat_seq_x +
+                    burdenCorr,
+                  data = burdenComp)
+
+# 4. Extract R² and p-values
+r2_base_snv <- summary(lm_base_snv)$r.squared
+r2_full_snv <- summary(lm_full_snv)$r.squared
+delta_r2_snv <- r2_full_snv - r2_base_snv
+
+pval_burden_snv <- summary(lm_full_snv)$coefficients["burdenCorr", "Pr(>|t|)"]
+pval_anova_snv <- anova(lm_base_snv, lm_full_snv)$`Pr(>F)`[2]
+
+# === INDEL ANALYSIS ===
+
+# 1. Raw correlation
+cor_test_indel <- cor.test(burdenComp$indelBurden, burdenComp$indelDNMs)
+
+# 2. Base model
+lm_base_indel <- lm(indelDNMs ~ Pat_Age_at_birth + Mat_Age_at_birth +
+                      sample.median.0.3vaf + Proband_seq_x + Pat_seq_x + Mat_seq_x,
+                    data = burdenComp)
+
+# 3. Full model
+lm_full_indel <- lm(indelDNMs ~ Pat_Age_at_birth + Mat_Age_at_birth + paternalAgeGap +
+                      sample.median.0.3vaf + Proband_seq_x + Pat_seq_x + Mat_seq_x +
+                      indelBurden,
+                    data = burdenComp)
+
+# 4. Extract R² and p-values
+r2_base_indel <- summary(lm_base_indel)$r.squared
+r2_full_indel <- summary(lm_full_indel)$r.squared
+delta_r2_indel <- r2_full_indel - r2_base_indel
+
+pval_burden_indel <- summary(lm_full_indel)$coefficients["indelBurden", "Pr(>|t|)"]
+pval_anova_indel <- anova(lm_base_indel, lm_full_indel)$`Pr(>F)`[2]
+
+# === REPORT ===
+
+cat("=== SNV Model ===\n")
+cat("Raw correlation (burdenCorr vs snvDNMs): p =", signif(cor_test_snv$p.value, 3), "\n")
+cat("P-value for sperm burden in full model:", signif(pval_burden_snv, 3), "\n")
+cat("Model improvement (ANOVA): p =", signif(pval_anova_snv, 3), "\n")
+cat("R² (base model):", round(r2_base_snv, 4), "\n")
+cat("R² (with sperm burden):", round(r2_full_snv, 4), "\n")
+cat("Additional variance explained:", round(delta_r2_snv * 100, 2), "%\n\n")
+
+cat("=== INDEL Model ===\n")
+cat("Raw correlation (indelBurden vs indelDNMs): p =", signif(cor_test_indel$p.value, 3), "\n")
+cat("P-value for sperm burden in full model:", signif(pval_burden_indel, 3), "\n")
+cat("Model improvement (ANOVA): p =", signif(pval_anova_indel, 3), "\n")
+cat("R² (base model):", round(r2_base_indel, 4), "\n")
+cat("R² (with sperm burden):", round(r2_full_indel, 4), "\n")
+cat("Additional variance explained:", round(delta_r2_indel * 100, 2), "%\n")
+
+ggplot(burdenComp, aes(x = burdenCorr, y = snvDNMs)) +
+  geom_point(size = 3, alpha = 0.8) +
+  geom_smooth(method = "lm", se = TRUE, color = "#1b9e77") +
+  labs(x = "Sperm SNV burden", y = "Offspring SNV DNM count") +
+  theme_pubr()
+
+burdenComp$pred_snv <- predict(lm_full_snv)
+
+ggplot(burdenComp, aes(x = pred_snv, y = snvDNMs)) +
+  geom_point(size = 3, alpha = 0.8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+  labs(x = "Predicted SNV DNM count", y = "Observed SNV DNM count") +
+  theme_pubr()
+
+r2_df <- tibble(
+  model = c("Base (age + QC)", "Full (+ sperm burden)"),
+  r2 = c(r2_base_snv, r2_full_snv)
+)
+
+ggplot(r2_df, aes(x = model, y = r2)) +
+  geom_col(fill = "#1b9e77", width = 0.6) +
+  ylim(0, 1) +
+  labs(y = "R² (variance explained)", x = NULL) +
+  theme_pubr()
+
+ggplot(burdenComp, aes(x = pred_snv, y = residuals(lm_full_snv))) +
+  geom_point(alpha = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(x = "Predicted DNM count", y = "Residuals") +
+  theme_pubr()
+
+```
+
+
+### Signatures
+```{r sigs, fig.width=6, fig.height=5}
+trioSigsProp <- trioSigs |> 
+  mutate(SBS1 = trioSigs$SBS1/(trioSigs$SBS1 + trioSigs$SBS5)) |> 
+  mutate(SBS5 = trioSigs$SBS5/(trioSigs$SBS1 + trioSigs$SBS5))
+
+sigs <- read_tsv(paste0(dataPath, "sigs.txt"), col_types = cols()) |> 
+  pivot_longer(cols = c(SBS1, SBS5), names_to = "sig", values_to = "sigCount") |> 
+  group_by(Samples) |> 
+  mutate(sigCount = sigCount / sum(sigCount)) |> 
+  ungroup() |> 
+  mutate(sig = fct_relevel(sig, "SBS5", "SBS1")) |> 
+  filter(Samples == "GermanTrio") |> 
+  mutate(sigCountTrioDNM = c(trioSigsProp$SBS1, trioSigsProp$SBS5))
+
+
+p_sigs <- ggplot(sigs, aes(x = Samples, y = sigCount, fill = sig)) +
+  geom_bar(stat = "identity") +
+  ylab("Signature contribution sperm") +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme_pubr() +
+  scale_fill_manual(values = c("SBS5" = "#80b1d3", "SBS1" = "#fdb462")) +
+  theme(
+    legend.title = element_blank(),
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_text(size = 12),
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.line.x = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+p_sigs
+
+p_DNMsigs <- ggplot(sigs, aes(x = Samples, y = sigCountTrioDNM, fill = sig)) +
+  geom_bar(stat = "identity") +
+  ylab("Signature contribution trio DNMs") +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme_pubr() +
+  scale_fill_manual(values = c("SBS5" = "#80b1d3", "SBS1" = "#fdb462")) +
+  theme(
+    legend.title = element_blank(),
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_text(size = 12),
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.line.x = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+p_sigs + p_DNMsigs
+
+p_sigs_lbl <- ggplot(sigs, aes(x = Samples, y = sigCount, fill = sig)) +
+  geom_bar(stat = "identity") +
+  geom_label(aes(label = sig),
+             position = position_stack(vjust = 0.5),
+             size = 3,
+             fill = "white",       # label background for contrast
+             alpha = 0.9,          # slight transparency
+             label.size = 0) +     # no border
+  ylab("Signature contribution sperm") +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme_pubr() +
+  scale_fill_manual(values = c("SBS5" = "#80b1d3", "SBS1" = "#fdb462")) +
+  theme(
+    legend.title = element_blank(),
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_text(size = 12),
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.line.x = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+p_DNMsigs_lbl <- ggplot(sigs, aes(x = Samples, y = sigCountTrioDNM, fill = sig)) +
+  geom_bar(stat = "identity") +
+  geom_label(aes(label = sig),
+             position = position_stack(vjust = 0.5),
+             size = 3,
+             fill = "white",
+             alpha = 0.9,
+             label.size = 0) +
+  ylab("Signature contribution trio DNMs") +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme_pubr() +
+  scale_fill_manual(values = c("SBS5" = "#80b1d3", "SBS1" = "#fdb462")) +
+  theme(
+    legend.title = element_blank(),
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_text(size = 12),
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.line.x = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+p_sigs_lbl + p_DNMsigs_lbl
+```
+
+### Trinuc profiles
+```{r trinuc, fig.height=5, fig.width=5}
+
+# Create the necessary vectors
+sub_vec <- c("C>A", "C>G", "C>T", "T>A", "T>C", "T>G")
+ctx_vec <- paste(rep(c("A", "C", "G", "T"), each = 4), rep(c("A", "C", "G", "T"), times = 4), sep = "-")
+full_vec <- paste(rep(sub_vec, each = 16), rep(ctx_vec, times = 6), sep = ",")
+xstr <- paste(substr(full_vec, 5, 5), substr(full_vec, 1, 1), substr(full_vec, 7, 7), sep = "")
+ordered_names <- paste(xstr, ">", rep(c("A", "G", "T", "A", "C", "G"), each = 16), sep = "")
+
+# Define colors for each sub_vec
+colours <- c("deepskyblue", "black", "firebrick2", "gray", "darkolivegreen3", "rosybrown2")
+names(colours) <- sub_vec  # Assign names to colors for mapping
+
+# Create a combined data frame
+trinucCounts <- tibble(
+  TRI = ordered_names,
+  xstr = xstr,
+  sub_vec = rep(sub_vec, each = 16)) |> 
+  left_join(spermVariants |> filter(str_detect(Sample_PD_ID, "PD6")) |>  group_by(TRI) |> summarize(mutation_counts = n(), .groups =  "drop") |> 
+  drop_na(), by = join_by(TRI)) |> 
+  left_join(spermVariants |> filter(str_detect(Sample_PD_ID, "PD5")) |>  group_by(TRI) |> summarize(apertFather_counts = n(), .groups =  "drop") |> 
+  drop_na(), by = join_by(TRI)) |> 
+  mutate(apertFather_counts = coalesce(apertFather_counts, 0)) |> 
+  left_join(trinucDNMs, by = join_by(TRI))
+
+trinucSperm <- ggplot(trinucCounts, aes(x = xstr, y = mutation_counts, fill = sub_vec)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.8) +
+  facet_wrap(~sub_vec, ncol = 6, scales = "free_x") +
+  scale_fill_manual(values = colours) +
+  scale_y_continuous(limits=c(0, NA), expand = c(0, 0)) +
+  labs(y = "Mutation counts", x = "Sperm trinucleotide mutations") +
+  theme_pubr() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.line.x = element_blank(),
+    legend.position = "none",
+    strip.text = element_blank(),
+    panel.spacing = unit(0, "lines"),
+    panel.grid = element_blank()
+  ) 
+
+trinucApert <- ggplot(trinucCounts, aes(x = xstr, y = apertFather_counts, fill = sub_vec)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.8) +
+  facet_wrap(~sub_vec, ncol = 6, scales = "free_x") +
+  scale_fill_manual(values = colours) +
+  scale_y_continuous(limits=c(0, NA), expand = c(0, 0)) +
+  labs(y = "Mutation counts", x = "Apert father sperm trinucleotide mutations") +
+  theme_pubr() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.line.x = element_blank(),
+    legend.position = "none",
+    strip.text = element_blank(),
+    panel.spacing = unit(0, "lines"),
+    panel.grid = element_blank()
+  ) 
+
+
+trinucDNM <- ggplot(trinucCounts, aes(x = xstr, y = dnmCount, fill = sub_vec)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.8) +
+  facet_wrap(~sub_vec, ncol = 6, scales = "free_x") +
+  scale_fill_manual(values = colours) +
+  scale_y_continuous(limits=c(0, NA), expand = c(0, 0)) +
+  labs(y = "Mutation counts", x = "Trio trinucleotide DNMs") +
+  theme_pubr() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.line.x = element_blank(),
+    legend.position = "none",
+    strip.text = element_blank(),
+    panel.spacing = unit(0, "lines"),
+    panel.grid = element_blank()
+  ) 
+
+
+# Data frame for rectangles
+domainsPlotObject <- data.frame(
+  recStart = 1:6,
+  recEnd = 2:7,
+  base = 0,
+  height = rep(1, 6),
+  type = sub_vec)
+# Create rectangles using ggplot
+pDomains <- ggplot(domainsPlotObject, aes(xmin = recStart, xmax = recEnd, ymin = base, ymax = height)) +
+    geom_rect(aes(fill = type), colour = "white") +
+    geom_text(aes(x = (recStart + recEnd) / 2, y = height + 0.1, label = type), color = "black", vjust = 0) +  # Adjust y position
+    scale_fill_manual(values = colours) +
+    theme_void() + 
+    scale_x_continuous(expand = c(0, 0)) +
+    scale_y_continuous(expand = c(0, 0), limits = c(0, max(domainsPlotObject$height) + 0.2)) +  # Adjust y limits
+    guides(fill = "none") + coord_cartesian(clip = "off")
+plot_spacer()/pDomains/trinucDNM/trinucSperm + plot_layout(heights = c(0.1,1, 15, 15))
+# pDomains/trinuc + plot_layout(heights = c(1, 15))
+
+plot_spacer()/pDomains/trinucDNM/trinucSperm/trinucApert + plot_layout(heights = c(0.1,1, 15, 15, 15))
+
+```
+
+##### Figure 1
+```{r fig1, fig.width=20, fig.height=8}
+
+
+p_graphic <- ggplot2::ggplot() + ggplot2::annotation_custom(grid::rasterGrob(readPNG(paste0(dataPath, "GraphicFig1a.png")),
+                                                width=ggplot2::unit(1,"npc"),
+                                                height=ggplot2::unit(1,"npc"),
+                                                interpolate = FALSE),
+                               -Inf, Inf, -Inf, Inf) + coord_fixed(ratio = 412/238, expand = FALSE, clip = "off") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = "white", colour = NA),
+        plot.margin = margin(0, 0, 0, 0))
+
+p_graphic
+layoutFig1 <- "
+ABCDF
+ABCEF
+AGHIK
+AGHJK"
+
+p_graphic  + labs(tag = "A") + snv_DNM_plot  + labs(tag = "B") + indel_DNM_plot  + labs(tag = "C") + pDomains + labs(tag = "D") + trinucDNM + p_DNMsigs_lbl + labs(tag = "E") + snv_plot + labs(tag = "F") + indel_plot + labs(tag = "G") + pDomains + labs(tag = "H") + trinucSperm + p_sigs_lbl + labs(tag = "I") +
+   plot_layout(design = layoutFig1, heights = c(1,15,1,15), widths = c(3,2,2,4,0.5)) &
+  theme(plot.tag = element_text(size = 14, face = "bold"))
+
+pdf(paste0(outputPath, 'Fig1_mutRates.pdf'), height=8, width=19, onefile = F)
+p_graphic  + labs(tag = "A") + snv_DNM_plot  + labs(tag = "B") + indel_DNM_plot  + labs(tag = "C") + pDomains + labs(tag = "D") + trinucDNM + p_DNMsigs_lbl + labs(tag = "E") + snv_plot + labs(tag = "F") + indel_plot + labs(tag = "G") + pDomains + labs(tag = "H") + trinucSperm + p_sigs_lbl + labs(tag = "I") +
+   plot_layout(design = layoutFig1, heights = c(1,15,1,15), widths = c(3,2,2,4,0.5)) &
+  theme(plot.tag = element_text(size = 14, face = "bold"))
+dev.off()
+```
+
+### Review Analysis: SCN1A exclusion sensitivity
+#### DNM burden: SCN1A exclusion
+```{r scn1a_DNMburden, fig.width=8, fig.height=5}
+# DD fathers only — controls removed. Rebuild from trioBurdens to retain FAM_ID.
+# Black dashed line (manuscript) plotted on top of blue solid (SCN1A excluded)
+# by ordering layers: blue first, black second.
+
+dnm_data_scn1a <- trioBurdens |>
+  select(dataset, FAM_ID, Pat_Age_at_birth, SNP_DNMs_0.3VAF, Indel_DNMs_0.3VAF) |>
+  rename(snv = SNP_DNMs_0.3VAF, indel = Indel_DNMs_0.3VAF) |>
+  pivot_longer(cols = c(snv, indel), names_to = "class", values_to = "DNM") |>
+  drop_na(DNM) |>
+  mutate(retained = if_else(FAM_ID %in% scn1a_fam_ids, "SCN1A excluded", "Retained"))
+
+p_dnmBurden_scn1a <- ggplot(
+  dnm_data_scn1a,
+  aes(x = Pat_Age_at_birth, y = DNM, fill = retained, colour = retained)
+) +
+  geom_point(size = 3, pch = 21, col = "white", stroke = 0.25) +
+  # SCN1A-excluded fit (blue solid — rendered first, underneath)
+  geom_smooth(
+    method = "lm", alpha = 0.15, inherit.aes = FALSE,
+    aes(x = Pat_Age_at_birth, y = DNM, linetype = "SCN1A excluded"),
+    colour = "#2166AC", linewidth = 1,
+    data = dnm_data_scn1a |> filter(retained == "Retained")
+  ) +
+  # All DD fathers fit (black dashed — rendered second, on top)
+  geom_smooth(
+    method = "lm", alpha = 0.10, inherit.aes = FALSE,
+    aes(x = Pat_Age_at_birth, y = DNM, linetype = "All DD fathers (manuscript)"),
+    colour = "black", linewidth = 1.2,
+    data = dnm_data_scn1a
+  ) +
+  facet_wrap(~ class, scales = "free_y",
+             labeller = labeller(class = c(snv = "SNV DNMs", indel = "Indel DNMs"))) +
+  scale_fill_manual(name = "Sample status",
+                    values = c("Retained" = "#56B4E9", "SCN1A excluded" = "#E69F00")) +
+  scale_colour_manual(name = "Sample status",
+                      values = c("Retained" = "#56B4E9", "SCN1A excluded" = "#E69F00")) +
+  scale_linetype_manual(name = "Linear fit",
+                        values = c("All DD fathers (manuscript)" = "dashed", "SCN1A excluded" = "solid")) +
+  xlab("Paternal age at birth") + ylab("De novo mutation count") +
+  ylim(0, NA) +
+  theme_pubr() +
+  theme(legend.position = "right", strip.background = element_blank(),
+        strip.text = element_text(size = 11))
+
+p_dnmBurden_scn1a
+```
+
+#### Sperm burden: SCN1A exclusion
+```{r scn1a_spermBurden, fig.width=8, fig.height=5}
+# DD fathers only — controls removed. Pivot to long format for SNV + indel facets.
+
+burdenCombined_scn1a <- spermSamplesFiltered |>
+  mutate(retained = if_else(Sample_PD_ID %in% scn1a_sperm_ids, "SCN1A excluded", "Retained")) |>
+  select(Sample_PD_ID, Age, retained, snv = snv_burden_corr_0.01vaf, indel = indel_burden_0.01vaf) |>
+  pivot_longer(cols = c(snv, indel), names_to = "class", values_to = "burden")
+
+p_spermBurden_scn1a <- ggplot(
+  burdenCombined_scn1a,
+  aes(x = Age, y = burden, fill = retained, colour = retained)
+) +
+  geom_point(size = 3.5, pch = 21, col = "white", stroke = 0.25) +
+  # SCN1A-excluded fit (blue solid — underneath)
+  geom_smooth(
+    method = "lm", alpha = 0.15, inherit.aes = FALSE,
+    aes(x = Age, y = burden, linetype = "SCN1A excluded"),
+    colour = "#2166AC", linewidth = 1,
+    data = burdenCombined_scn1a |> filter(retained == "Retained")
+  ) +
+  # All DD fathers fit (black dashed — on top)
+  geom_smooth(
+    method = "lm", alpha = 0.10, inherit.aes = FALSE,
+    aes(x = Age, y = burden, linetype = "All DD fathers (manuscript)"),
+    colour = "black", linewidth = 1.2,
+    data = burdenCombined_scn1a
+  ) +
+  facet_wrap(~ class, scales = "free_y",
+             labeller = labeller(class = c(snv = "SNV burden", indel = "Indel burden"))) +
+  scale_fill_manual(name = "Sample status",
+                    values = c("Retained" = "#56B4E9", "SCN1A excluded" = "#E69F00")) +
+  scale_colour_manual(name = "Sample status",
+                      values = c("Retained" = "#56B4E9", "SCN1A excluded" = "#E69F00")) +
+  scale_linetype_manual(name = "Linear fit",
+                        values = c("All DD fathers (manuscript)" = "dashed", "SCN1A excluded" = "solid")) +
+  xlab("Age (years)") + ylab("Burden (corrected)") +
+  ylim(0, NA) +
+  theme_pubr() +
+  theme(legend.position = "right", strip.background = element_blank(),
+        strip.text = element_text(size = 11))
+
+p_spermBurden_scn1a
+```
+
+#### Sperm vs DNM burden: SCN1A exclusion
+```{r scn1a_spermVsDNM, fig.width=9, fig.height=5}
+# Refit all four models (base + full, SNV + indel) on SCN1A-excluded burdenComp.
+# Report change in p-value and R² as a grouped bar chart.
+
+burdenComp_scn1a <- burdenComp |>
+  mutate(retained = if_else(FAM_ID %in% scn1a_fam_ids, "SCN1A excluded", "Retained"))
+
+dd_excl <- burdenComp_scn1a |> filter(retained == "Retained")
+
+lm_base_snv_scn1a  <- lm(snvDNMs ~ Pat_Age_at_birth + Mat_Age_at_birth +
+                            sample.median.0.3vaf + Proband_seq_x + Pat_seq_x + Mat_seq_x,
+                          data = dd_excl)
+lm_full_snv_scn1a  <- lm(snvDNMs ~ Pat_Age_at_birth + Mat_Age_at_birth + paternalAgeGap +
+                            sample.median.0.3vaf + Proband_seq_x + Pat_seq_x + Mat_seq_x +
+                            burdenCorr,
+                          data = dd_excl)
+lm_base_indel_scn1a <- lm(indelDNMs ~ Pat_Age_at_birth + Mat_Age_at_birth +
+                             sample.median.0.3vaf + Proband_seq_x + Pat_seq_x + Mat_seq_x,
+                           data = dd_excl)
+lm_full_indel_scn1a <- lm(indelDNMs ~ Pat_Age_at_birth + Mat_Age_at_birth + paternalAgeGap +
+                             sample.median.0.3vaf + Proband_seq_x + Pat_seq_x + Mat_seq_x +
+                             indelBurden,
+                           data = dd_excl)
+
+# Compile p-values and R²
+r2_summary <- tibble(
+  class       = rep(c("SNV", "Indel"), each = 4),
+  model_set   = rep(c("Manuscript", "Manuscript", "SCN1A excluded", "SCN1A excluded"), 2),
+  model_type  = rep(c("Base model", "Full model\n(+sperm burden)"), 4),
+  r2          = c(
+    summary(lm_base_snv)$r.squared,   summary(lm_full_snv)$r.squared,
+    summary(lm_base_snv_scn1a)$r.squared, summary(lm_full_snv_scn1a)$r.squared,
+    summary(lm_base_indel)$r.squared,  summary(lm_full_indel)$r.squared,
+    summary(lm_base_indel_scn1a)$r.squared, summary(lm_full_indel_scn1a)$r.squared
+  ),
+  p_burden    = c(
+    NA, summary(lm_full_snv)$coefficients["burdenCorr", "Pr(>|t|)"],
+    NA, summary(lm_full_snv_scn1a)$coefficients["burdenCorr", "Pr(>|t|)"],
+    NA, summary(lm_full_indel)$coefficients["indelBurden", "Pr(>|t|)"],
+    NA, summary(lm_full_indel_scn1a)$coefficients["indelBurden", "Pr(>|t|)"]
+  )
+) |> mutate(
+  class      = factor(class,      levels = c("SNV", "Indel")),
+  model_set  = factor(model_set,  levels = c("Manuscript", "SCN1A excluded")),
+  model_type = factor(model_type, levels = c("Base model", "Full model\n(+sperm burden)"))
+)
+
+cat("=== p-values for sperm burden term ===\n")
+r2_summary |> filter(!is.na(p_burden)) |>
+  select(class, model_set, p_burden) |>
+  mutate(p_burden = signif(p_burden, 3)) |>
+  print()
+
+p_r2_scn1a <- ggplot(r2_summary,
+       aes(x = model_set, y = r2, fill = model_type)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.65, colour = "black") +
+  geom_text(
+    data = r2_summary |> filter(!is.na(p_burden)),
+    aes(label = paste0("p=", signif(p_burden, 2)), group = model_type),
+    position = position_dodge(width = 0.7),
+    vjust = -0.4, size = 3
+  ) +
+  facet_wrap(~ class) +
+  scale_fill_manual(name = NULL,
+                    values = c("Base model" = "grey70",
+                               "Full model\n(+sperm burden)" = "#2166AC")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(x = NULL, y = expression("Variance explained (" * R^2 * ")")) +
+  theme_pubr() +
+  theme(strip.background = element_blank(), strip.text = element_text(face = "bold"),
+        legend.position = "right")
+
+p_r2_scn1a
+```
+
+#### Combined SCN1A sensitivity figure
+```{r scn1a_combined, fig.width=10, fig.height=10}
+
+make_dnm_panel_scn1a <- function(cls) {
+  dat    <- dnm_data_scn1a |> filter(class == cls)
+  ylab_str <- if (cls == "snv") "DNM SNV burden" else "DNM indel burden"
+  ggplot(dat, aes(x = Pat_Age_at_birth, y = DNM, fill = retained, colour = retained)) +
+    geom_point(size = 3, pch = 21, col = "white", stroke = 0.25) +
+    geom_smooth(
+      method = "lm", alpha = 0.15, inherit.aes = FALSE,
+      aes(x = Pat_Age_at_birth, y = DNM, linetype = "SCN1A excluded"),
+      colour = "#2166AC", linewidth = 1,
+      data = dat |> filter(retained == "Retained")
+    ) +
+    geom_smooth(
+      method = "lm", alpha = 0.10, inherit.aes = FALSE,
+      aes(x = Pat_Age_at_birth, y = DNM, linetype = "All DD fathers (manuscript)"),
+      colour = "black", linewidth = 1.2,
+      data = dat
+    ) +
+    scale_fill_manual(name = "Sample status",
+                      values = c("Retained" = "#56B4E9", "SCN1A excluded" = "#E69F00")) +
+    scale_colour_manual(name = "Sample status",
+                        values = c("Retained" = "#56B4E9", "SCN1A excluded" = "#E69F00")) +
+    scale_linetype_manual(name = "Linear fit",
+                          values = c("All DD fathers (manuscript)" = "dashed",
+                                     "SCN1A excluded" = "solid")) +
+    xlab("Paternal age at birth") + ylab(ylab_str) +
+    ylim(0, NA) +
+    theme_pubr() +
+    theme(legend.position = "right")
+}
+
+make_sperm_panel_scn1a <- function(cls) {
+  dat      <- burdenCombined_scn1a |> filter(class == cls)
+  ylab_str <- if (cls == "snv") "Sperm SNV burden" else "Sperm indel burden"
+  ggplot(dat, aes(x = Age, y = burden, fill = retained, colour = retained)) +
+    geom_point(size = 3.5, pch = 21, col = "white", stroke = 0.25) +
+    geom_smooth(
+      method = "lm", alpha = 0.15, inherit.aes = FALSE,
+      aes(x = Age, y = burden, linetype = "SCN1A excluded"),
+      colour = "#2166AC", linewidth = 1,
+      data = dat |> filter(retained == "Retained")
+    ) +
+    geom_smooth(
+      method = "lm", alpha = 0.10, inherit.aes = FALSE,
+      aes(x = Age, y = burden, linetype = "All DD fathers (manuscript)"),
+      colour = "black", linewidth = 1.2,
+      data = dat
+    ) +
+    scale_fill_manual(name = "Sample status",
+                      values = c("Retained" = "#56B4E9", "SCN1A excluded" = "#E69F00")) +
+    scale_colour_manual(name = "Sample status",
+                        values = c("Retained" = "#56B4E9", "SCN1A excluded" = "#E69F00")) +
+    scale_linetype_manual(name = "Linear fit",
+                          values = c("All DD fathers (manuscript)" = "dashed",
+                                     "SCN1A excluded" = "solid")) +
+    xlab("Age (years)") + ylab(ylab_str) +
+    ylim(0, NA) +
+    theme_pubr() +
+    theme(legend.position = "right")
+}
+
+# Legends suppressed on panels a, b, c at call site; panel d keeps its legend (right).
+# Panel e keeps its own legend (right). No guide collection used.
+no_leg <- guides(fill = "none", colour = "none", linetype = "none")
+p_snvDNM_scn1a     <- make_dnm_panel_scn1a("snv")   + no_leg
+p_indelDNM_scn1a   <- make_dnm_panel_scn1a("indel") + no_leg
+p_snvSperm_scn1a   <- make_sperm_panel_scn1a("snv")   + no_leg
+p_indelSperm_scn1a <- make_sperm_panel_scn1a("indel")
+
+rebuttal_fig1 <- (p_snvDNM_scn1a + p_indelDNM_scn1a) /
+  (p_snvSperm_scn1a + p_indelSperm_scn1a) /
+  p_r2_scn1a +
+  plot_layout(heights = c(1, 1, 0.8)) +
+  plot_annotation(tag_levels = "A") &
+  theme(plot.tag = element_text(size = 14, face = "bold"))
+
+rebuttal_fig1
+```
+
+## c) Comp DNMs
+### Plot VAFs
+```{r plotVAFs}
+
+
+pDiagVarCov <- ggplot(diagnosticVarsCalls |> filter(duplexCov > 0) |> 
+                        mutate(Cohort = factor(Cohort, levels = c("DD fathers", "Apert fathers"))),
+       aes(x = Cohort, y = duplexCov, fill = Cohort)) +
+  geom_boxplot(outlier.shape = NA, width = 0.3) +
+  geom_jitter(width = 0.15, size = 3.5, pch = 21, col = 'white', stroke = 0.25, alpha = 0.7) +
+  scale_fill_manual(values = dataset_colours) +
+  theme_pubr() +
+  ylab("Sperm duplex coverage of causal DNM site") +
+  theme(
+    axis.title.x = element_blank(), 
+    legend.position = "none", 
+    legend.title = element_blank()    
+  )
+
+pDiagVarCov
+
+median(diagnosticVarsCalls |> filter(Cohort == "DD fathers") |> pull(duplexCov))
+median(diagnosticVarsCalls |> filter(Cohort == "Apert fathers") |> pull(duplexCov))
+
+```
+
+### Compare UMI vs Duplex
+```{r compareUmiDuplex}
+# Build UMI table
+umi_tbl <- read_csv(file.path(dataPath, "UMIdiagVarFreqs.csv"), col_types = cols()) |>
+  separate(Var, into = c("IND_ID", "VAR_ID", "gene"), sep = "\\|") |>
+  mutate(across(c(IND_ID, VAR_ID, gene), str_trim)) |>
+  transmute(
+    Variant = paste0(VAR_ID, " | ", gene),
+    Tissue,
+    UMI_Neuser2025 = as.numeric(str_remove(`VAF with UMI collapsing`, "%")) / 100
+  )
+
+# Build NanoSeq table (diagnostic calls)
+nano_tbl <- diagnosticVarsCalls |>
+  filter(varLabel != "") |>
+  transmute(
+    Variant = paste0(VAR_ID, " | ", gene),
+    Tissue = "semen father",
+    duplexVAF = duplexVAF,
+    BAM_VAF = na_if(BAM_VAF, -0.01)
+  )
+
+# Join and reshape; keep UMI and duplex VAFs for plotting
+umi_vs_duplex <- full_join(umi_tbl, nano_tbl, by = c("Variant", "Tissue")) |>
+  select(Variant, Tissue, UMI_Neuser2025, duplexVAF) |>
+  pivot_longer(
+    cols = c(UMI_Neuser2025, duplexVAF),
+    names_to = "Method",
+    values_to = "VAF"
+  ) |>
+  drop_na(VAF) |>
+  mutate(
+    SeqType = if_else(Method == "UMI_Neuser2025", "UMI_Neuser2025", "NanoSeq"),
+  ) |> 
+  bind_rows(tibble(Variant = c("VAR_223 | EZH2", "VAR_249 | SCN1A"),
+                   Tissue = "semen father",
+                   Method = "Case report",
+                   SeqType = "UMI_Neuser2025",
+                   VAF = c(0.0311,0.1054561)))
+
+# Plot
+pUMIcomp <- umi_vs_duplex |>
+  filter(Tissue == "semen father", Variant != "VAR_155 | PRPF38A") |>
+  ggplot(aes(x = Variant, y = VAF, fill = SeqType)) +
+  geom_point(size = 3.5, pch = 21, colour = "white", stroke = 0.25,
+             position = position_dodge(width = 0.6)) +
+  theme_pubr() +
+  scale_fill_manual(values = c("UMI_Neuser2025" = "#0072B2", "NanoSeq" = "#E69F00")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title.x = element_blank(),
+        legend.position = c(0.2,0.7))
+pUMIcomp
+```
+
+#### SupFig 4
+```{r extFigDiag, fig.height=5, fig.width=12}
+
+pDiagVarCov + pUMIcomp + plot_annotation(tag_levels = "A") &
+  theme(plot.tag = element_text(size = 14, face = "bold"))
+
+pdf(paste0(outputPath, 'SupFig4_VAF.pdf'), height=5, width=10, onefile = F)
+pDiagVarCov + pUMIcomp + plot_annotation(tag_levels = "A") &
+  theme(plot.tag = element_text(size = 14, face = "bold"))
+dev.off()
+
+```
+
+## d) dNdS
+### Sig genes
+```{r dndsTargeted}
+# Gene-level and hotspot dN/dS results (Tables S9/S10). SEMG1 and MECP2 are
+# excluded as spurious signals (see DDfathers_processing.Rmd).
+sig_dndsAll <- supTables_list[["Table S9 dNdSgeneLevel"]]
+sig_dndsHotspot <- supTables_list[["Table S10 dNdShotspot"]] |> filter(!is.na(significant))
+
+# Sig twinsUK
+sigTwinsUK <- read_tsv(paste0(dataPath, "twinsUK_sigGenes.tsv"), col_types = cols()) |> filter(testSig == "Exome-wide")
+sigTwinsUKall <- read_tsv(paste0(dataPath, "twinsUK_SupTable3_sig_dndsAll.tsv"), col_types = cols())
+
+# Gene set of known germline sig genes in TwinsUK/Goriely
+knownPosSelection <- c("PTPN11", "FGFR3", "FGFR2", "HRAS", "RET", "BRAF", "KRAS", "MAP2K1", "MAP2K2", "SOS1", "CBL", "RAF1", "SMAD4")
+knownGermline <- unique(c(sigTwinsUK  |> pull(gene_name), knownPosSelection))
+
+sigGenes <- sig_dndsAll |> filter(qglobal_cv < 0.01 | gene_name %in% sig_dndsHotspot$gene) |>
+  mutate(sigTwinsUK = if_else(gene_name %in% c(sigTwinsUK$gene_name), "Yes", "No"))
+
+paste((sigGenes |> filter(sigTwinsUK == "Yes") |> pull(gene_name)), collapse = ", ")
+paste((sigGenes |> filter(sigTwinsUK == "No") |> pull(gene_name)), collapse = ", ")
+
+```
+
+### dnds Plots
+#### Objects
+```{r objectsdnds}
+classOrder <- c("syn", "mis", "non", "spl", "non+spl", "ind")
+classOrderLong <- c("synonymous", "missense", "nonsense", "splice", "nonsense+splice", "indel")
+geneGroupOrder <- c("excess_other", "excess_dNdS_novel",  "excess_known", "expected")
+mutType_colours <- c("synonymous" = "grey70",
+                     "missense" = "cadetblue",
+                    "nonsense" = "darkorchid4",
+                    "nonsense+splice" = "darkorchid3",
+                    "splice" = "darkorchid2",
+                    "indels" = "chocolate3",
+                    "indel" = "chocolate3",
+                    "syn" = "grey70",
+                     "mis" = "cadetblue",
+                    "non" = "darkorchid4",
+                    "non+spl" = "darkorchid3",
+                    "spl" = "darkorchid2",
+                    "ind" = "chocolate3")
+
+
+```
+
+#### Global dNdS
+```{r fig_global_dNdS, fig.height = 4, fig.width = 5}
+
+# Global dN/dS values 
+p_globaldnds <- read_tsv(paste0(dataPath, "globaldnds_TriMeth_Panel_withControls.tsv"), col_types = cols()) |> 
+  filter(name %in% c("wall")) |> 
+  mutate(dataset = factor(dataset, levels = c("DD fathers","Controls"))) |> 
+  ggplot(aes(x = dataset, y = mle, fill = dataset, group = dataset)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_errorbar(
+    aes(ymin = cilow, ymax = cihigh),
+    position = position_dodge(width = 0.8),
+    width = 0.2, color = "black"
+  ) +
+  geom_hline(yintercept = 1, linetype = 'dashed') + 
+  scale_fill_manual(values = dataset_colours) +
+  scale_y_continuous(expand = c(0,0)) +
+  ylab("Global dN/dS (220 gene panel)") +
+  theme_pubr() +
+  theme(
+    axis.title.x = element_blank(),
+    legend.position = "none",
+    legend.title = element_blank(),
+    strip.background = element_blank()
+  )
+
+p_globaldnds
+```
+
+
+#### Gene dNdS
+```{r fig_gene_dNdS, fig.height = 8, fig.width = 12}
+
+
+p_dndsMuts <- sigGenes |> 
+  mutate(totMuts = n_syn+n_mis+n_spl+n_non+n_ind)|> 
+  #Group non+spl
+  mutate(`n_non+spl` = n_spl+n_non) |> select(-c(n_spl,n_non)) |> 
+  pivot_longer(cols = starts_with("n_"), names_to = "class", names_prefix = "n_", values_to = "muts") |> 
+  mutate(class = fct_relevel(class, rev(classOrder))) |>
+  mutate(gene_name = fct_reorder(gene_name, totMuts, .desc = T)) |>
+  ggplot(aes(x = gene_name, y = muts, fill = class)) + 
+    geom_bar(position="stack", stat="identity") +
+  scale_fill_manual(values = mutType_colours) +
+  scale_y_continuous(expand = c(0,0)) +
+  coord_flip() +
+  ylab("Mutations") +
+  theme_pubr() +
+  theme(axis.title.y = element_blank(), legend.position=c(.82,.6), 
+        strip.background = element_blank(), strip.text =element_text(size = 14))
+
+p_dndsRatios <- sigGenes |>  
+  mutate(totMuts = n_syn+n_mis+n_spl+n_non+n_ind) |> 
+  pivot_longer(cols = starts_with("w"), names_to = "class", names_prefix = "w", values_to = "ratio") |> 
+  filter(class != "spl_cv") |> 
+  mutate(class = str_remove(class, "_cv")) |> 
+  mutate(class = str_replace(class, "non", "non+spl")) |> 
+  mutate(class = fct_relevel(class, classOrder)) |>
+  mutate(gene_name = fct_reorder(gene_name, totMuts, .desc = T)) |>
+  ggplot(aes(x = gene_name, y = ratio, fill = class)) + 
+    geom_bar(position="dodge", stat="identity") +
+  scale_fill_manual(values = mutType_colours) +
+  scale_y_continuous(expand = c(0,0)) +
+  coord_flip() +
+  ylab("dN/dS Observed/Expected") + 
+  xlab("Targeted") +
+  theme_pubr() +
+  theme(axis.title.y = element_blank(), axis.text.y = element_blank(),
+        legend.position="none",
+        strip.background = element_blank(), strip.text = element_text(colour = "white"), axis.ticks.y = element_blank()) 
+p_dndsMuts + p_dndsRatios + plot_layout(widths = c(1, 2)) 
+
+```
+
+#### Sig Comp
+```{r fig_sig_dNdS, fig.height = 6, fig.width = 9}
+
+sigComp <- sig_dndsAll |> 
+  select(gene_name, pglobal_cv, qglobal_cv) |> 
+  mutate(pglobal_cv = if_else(pglobal_cv <1e-30 , 1e-30, pglobal_cv)) |>
+  left_join(
+    read_tsv(paste0(dataPath, "twinsUK_SupTable3_sig_dndsAll.tsv"), col_types = cols()) |> 
+      select(gene_name, pTwinsUK = pglobal_cv, qTwinsUK = qglobal_cv), 
+    by = join_by(gene_name)
+  ) |> 
+  drop_na() |> 
+  mutate(pglobal_cv = if_else(pglobal_cv == 0, 1e-15, pglobal_cv)) |> 
+  mutate(across(where(is.numeric), ~ ifelse(. == 0, 1e-15, .))) |> 
+  # Label signficance across datasets
+  mutate(dndsLabel = if_else(gene_name %in% sigTwinsUK$gene_name & gene_name %in% sigGenes$gene_name, "DD fathers & Controls", "NS")) |> 
+  mutate(dndsLabel = if_else(gene_name %in% sigTwinsUK$gene_name & !(gene_name %in% sigGenes$gene_name), "Controls", dndsLabel)) |> 
+  mutate(dndsLabel = if_else(!(gene_name %in% sigTwinsUK$gene_name) & gene_name %in% sigGenes$gene_name, "DD fathers", dndsLabel)) |> 
+  mutate(gene_name = if_else(dndsLabel == "NS", "", gene_name)) |> 
+  mutate(dndsLabel = factor(dndsLabel, levels = c("DD fathers & Controls","DD fathers","Controls","NS")))
+
+# Compute approximate p-value cutoffs
+last_below_q_global <- sigComp |> arrange(qglobal_cv) |> filter(qglobal_cv <= 0.01) |> slice(n()) |> pull(pglobal_cv)
+first_above_q_global <- sigComp |> arrange(qglobal_cv) |> filter(qglobal_cv > 0.01) |> slice(1) |> pull(pglobal_cv)
+p_cutoff_global <- (last_below_q_global + first_above_q_global) / 2
+
+last_below_q_twinsUK <- sigComp |> arrange(qTwinsUK) |> filter(qTwinsUK <= 0.1) |> slice(n()) |> pull(pTwinsUK)
+first_above_q_twinsUK <- sigComp |> arrange(qTwinsUK) |> filter(qTwinsUK > 0.1) |> slice(1) |> pull(pTwinsUK)
+p_cutoff_twinsUK <- (last_below_q_twinsUK + first_above_q_twinsUK) / 2
+
+
+# Create a dummy row to fake the asterisk legend entry
+legend_key_df <- tibble(
+  pglobal_cv = Inf,
+  pTwinsUK = Inf,
+)
+
+# Plot
+p_sigComp <- ggplot(sigComp, aes(x = -log(pglobal_cv), y = -log(pTwinsUK), fill = dndsLabel)) +
+  # NS points first (lighter and underneath)
+  geom_point(data = sigComp |> filter(dndsLabel == "NS"),
+             aes(fill = dndsLabel), size = 3.5, pch = 21,
+             color = "white", stroke = 0.25, alpha = 0.5) +
+  # All other points on top
+  geom_point(data = sigComp |> filter(dndsLabel != "NS"),
+             aes(fill = dndsLabel), size = 3.5, pch = 21,
+             color = "white", stroke = 0.25) +
+  # FDR cutoff: only horizontal line appears in legend
+  geom_vline(xintercept = -log(p_cutoff_global), linetype = "dashed", color = "red") +
+  geom_hline(aes(yintercept = -log(p_cutoff_twinsUK), linetype = "FDR q cutoff"), color = "red") +
+  # Labels
+  geom_text_repel(
+    aes(label = gene_name), 
+    data = sigComp |> filter(!(is.na(dndsLabel))), 
+    size = 3, color = "black", max.overlaps = Inf) +
+  # Legend controls
+  scale_fill_manual(
+    name = "dN/dS Significance",
+    values = c(dataset_colours),
+    breaks = c("DD fathers & Controls", "DD fathers", "Controls", "NS", "* Hotspot significant")
+  ) +
+  scale_linetype_manual(
+    name = NULL,  # remove title
+    values = c("FDR q cutoff" = "dashed")
+  ) +
+  # Axis labels
+  labs(x = "Gene -log(p) DD fathers", y = "Gene -log(p) Controls") +
+  # Final theme
+  theme_pubr() +
+  theme(
+    legend.position = c(0.85, 0.6),
+    legend.title.align = 0)
+
+p_sigComp
+
+
+```
+
+## e) Path burden
+```{r vafSums}
+# TwinsUK VAF sums (tukVafSums) are individual-level and controlled-access - see
+# README. When twinsUKDataAvailable it's read in directly as in the manuscript
+# (relabelling vafGroup "ClinDDlofCADD" -> "likelyDisease" to match the naming
+# used below for the DD-father side); otherwise the age-trend fits/stats derived
+# from it (data/twinsUK_vafFits.tsv, data/twinsUK_exomePanelCorrection_stats.tsv -
+# both pure aggregate summaries) are used instead further down.
+if (twinsUKDataAvailable) {
+  tukVafSums <- read_tsv(paste0(dataPath, "tukGermanPanelVafSums.tsv"), col_types = cols()) |>
+    mutate(source = "Controls") |>
+    mutate(vafGroup = if_else(vafGroup == "ClinDDlofCADD", "likelyDisease", vafGroup))
+} else {
+  twinsUK_vafFits <- read_tsv(paste0(dataPath, "twinsUK_vafFits.tsv"), col_types = cols())
+  twinsUK_exomePanelCorrection_stats <- read_tsv(paste0(dataPath, "twinsUK_exomePanelCorrection_stats.tsv"), col_types = cols())
+}
+
+vafSumsVars <- spermVariants |>
+  bind_rows(spermVariants |> filter(likelyDisease) |> mutate(vafGroup = "likelyDisease")) |> 
+  bind_rows(spermVariants |> filter(likelyDriver) |> mutate(vafGroup = "allPos")) |> 
+  bind_rows(spermVariants |> filter(likelyDisease & likelyDriver) |> mutate(vafGroup = "posPath")) |>
+  group_by(Sample_PD_ID, Age, vafGroup) |> 
+  summarize(vafSum = sum(DUPLEX_VAF, na.rm = TRUE), countSum = sum(TIMES_CALLED), .groups = "drop") |> 
+  complete(nesting(Sample_PD_ID, Age), vafGroup, fill = list(countSum=0, vafSum = 0)) |> 
+  mutate(method = "obs") |>
+  mutate(source = if_else(str_detect(Sample_PD_ID, "PD6"), "DD fathers", "Apert fathers"))
+```
+
+### Selection VAF
+```{r geneContribC, fig.height=3, fig.width=8}
+
+# TwinsUK's quasibinomial age-trend (fit live here when available, otherwise
+# drawn from the pre-computed aggregate fit) is added as a line+ribbon layer
+# rather than bind_rows-ing individual TwinsUK points into the plot data.
+driverVafBase <- vafSumsVars |> filter(vafGroup == "allPos" & source != "Apert fathers")
+if (twinsUKDataAvailable) driverVafBase <- bind_rows(driverVafBase, tukVafSums |> filter(vafGroup == "allPos"))
+
+p_vafSumsGenesDriver <- driverVafBase |>
+  ggplot(aes(x = Age, y = vafSum, colour = source, fill = source)) +
+  geom_point(size = 2) +
+  stat_smooth(method = "glm", formula = 'y ~ x', method.args = list(family = "quasibinomial"),
+              se = TRUE, level = 0.95) +
+  scale_colour_manual(values = dataset_colours) +
+  scale_fill_manual(values = dataset_colours) +
+    scale_y_continuous(labels = scales::percent, limits = c(0, NA)) +
+  ylab("% of sperm with known driver") +
+  xlab('Age (years)') +
+  theme_pubr() +
+  theme(legend.position = c(0.2,0.8), legend.title = element_blank(), strip.background = element_blank())
+
+if (!twinsUKDataAvailable) {
+  driverVafFitTUK <- predict_from_fit_table(twinsUK_vafFits, "vafSum_allPos_quasibinom", seq(min(driverVafBase$Age), max(driverVafBase$Age), by = 1))
+  p_vafSumsGenesDriver <- p_vafSumsGenesDriver +
+    geom_ribbon(data = driverVafFitTUK, aes(x = Age, ymin = ci_lo, ymax = ci_hi, fill = "Controls"), inherit.aes = FALSE, alpha = 0.25) +
+    geom_line(data = driverVafFitTUK, aes(x = Age, y = fit, colour = "Controls"), inherit.aes = FALSE, linewidth = 1.1)
+}
+
+p_vafSumsGenesDriver
+
+driverVafBaseApert <- vafSumsVars |> filter(vafGroup == "allPos")
+if (twinsUKDataAvailable) driverVafBaseApert <- bind_rows(driverVafBaseApert, tukVafSums |> filter(vafGroup == "allPos"))
+
+p_vafSumsGenesDriverApert <- driverVafBaseApert |>
+  ggplot(aes(x = Age, y = vafSum, colour = source, fill = source)) +
+  geom_point(size = 2) +
+  stat_smooth(method = "glm", formula = 'y ~ x', method.args = list(family = "quasibinomial"),
+              se = TRUE, level = 0.95) +
+  scale_colour_manual(values = dataset_colours) +
+  scale_fill_manual(values = dataset_colours) +
+    scale_y_continuous(labels = scales::percent, limits = c(0, NA)) +
+  ylab("% of sperm with known driver") +
+  xlab('Age (years)') +
+  theme_pubr() +
+  theme(legend.position = c(0.2,0.8), legend.title = element_blank(), strip.background = element_blank())
+
+if (!twinsUKDataAvailable) {
+  driverVafFitTUKApert <- predict_from_fit_table(twinsUK_vafFits, "vafSum_allPos_quasibinom", seq(min(driverVafBaseApert$Age), max(driverVafBaseApert$Age), by = 1))
+  p_vafSumsGenesDriverApert <- p_vafSumsGenesDriverApert +
+    geom_ribbon(data = driverVafFitTUKApert, aes(x = Age, ymin = ci_lo, ymax = ci_hi, fill = "Controls"), inherit.aes = FALSE, alpha = 0.25) +
+    geom_line(data = driverVafFitTUKApert, aes(x = Age, y = fit, colour = "Controls"), inherit.aes = FALSE, linewidth = 1.1)
+}
+
+p_vafSumsGenesDriverApert
+
+fit <- glm(vafSum ~ Age, family = quasibinomial, data = vafSumsVars |> filter(vafGroup == "allPos" & source == "DD fathers"))
+summary(fit)
+# Get the predicted values (on the logit scale) and the standard errors
+preds <- predict(fit, data.frame(Age = c(30, 60)), type = "link", se.fit = TRUE)
+predicted_vals <- preds$fit
+
+# Calculate the 95% confidence intervals on the logit scale
+lower_ci <- predicted_vals - 1.96 * preds$se.fit
+upper_ci <- predicted_vals + 1.96 * preds$se.fit
+
+predsDriverRate <- tibble(
+  Age = c(30, 60),
+  Predicted_VAF = plogis(predicted_vals),
+  Lower_CI = plogis(lower_ci),
+  Upper_CI = plogis(upper_ci))
+
+
+```
+
+##### Figure 2
+```{r fig2, fig.height=10, fig.width=13}
+
+((p_globaldnds + p_vafSumsGenesDriver + plot_layout(widths = c(1, 4))) /
+  (p_dndsMuts + p_dndsRatios + p_sigComp + plot_layout(widths = c(1, 1, 3)))) +
+  plot_layout(heights = c(1, 2)) +
+  plot_annotation(tag_levels = "A") &
+  theme(plot.tag = element_text(size = 14, face = "bold"))
+
+pdf(paste0(outputPath, 'Fig2_selection.pdf'), height=10, width=13, onefile = F)
+((p_globaldnds + p_vafSumsGenesDriver + plot_layout(widths = c(1, 4))) /
+  (p_dndsMuts + p_dndsRatios + p_sigComp + plot_layout(widths = c(1, 1, 3)))) +
+  plot_layout(heights = c(1, 2)) +
+  plot_annotation(tag_levels = "A") &
+  theme(plot.tag = element_text(size = 14, face = "bold"))
+dev.off()
+
+```
+### Disease VAF
+#### Calibrate exome correction
+This whole calibration (exome-to-panel capture fraction) compares TwinsUK's own
+panel vs exome sequencing of the same individuals - there's no DD-father
+equivalent (DD fathers weren't exome sequenced), so when TwinsUK data isn't
+available there's nothing to plot as points; `exomePanelCorrection` (used
+throughout the rest of this notebook to scale DD-father panel VAF sums to
+exome-equivalent estimates) and the reported stats are read back from the
+pre-computed aggregate summary instead.
+```{r germanTwin}
+if (twinsUKDataAvailable) {
+  # Exome→panel capture fraction + stats to report (R², slope, P for age, correlation, n)
+
+  ## 1) Point estimate: fraction of exome-wide likely-disease VAF captured by 220-gene panel
+  fractionWithinPanel <- tukVafSums |>
+    group_by(vafGroup) |>
+    summarize(
+      totalVAFs      = sum(vafSum, na.rm = TRUE),
+      totalVAFsExome = sum(exome_vafSum, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    mutate(percentageInPanel = totalVAFs / totalVAFsExome)
+
+  exomePanelCorrection <- fractionWithinPanel |>
+    filter(vafGroup == "likelyDisease") |>
+    pull(percentageInPanel)
+
+  ## 2) Per-sample ratio + basic QC + age-association stats
+  panel_exome_df <- tukVafSums |>
+    filter(vafGroup == "likelyDisease") |>
+    mutate(
+      percentageInPanel = vafSum / exome_vafSum
+    ) |>
+    filter(is.finite(percentageInPanel), percentageInPanel > 0)
+
+  n_samples <- nrow(panel_exome_df)
+  n_sources <- dplyr::n_distinct(panel_exome_df$source)
+
+  # Correlation of panel vs exome burden (VAF sums) across samples
+  cor_test <- cor.test(panel_exome_df$vafSum, panel_exome_df$exome_vafSum, method = "pearson")
+
+  # Age dependence of the fraction captured (key claim: no age trend)
+  fit_age <- lm(percentageInPanel ~ Age, data = panel_exome_df)
+  fit_age_sum <- summary(fit_age)
+  beta_age <- coef(fit_age)["Age"]
+  se_age   <- coef(fit_age_sum)["Age", "Std. Error"]
+  p_age    <- coef(fit_age_sum)["Age", "Pr(>|t|)"]
+  r2_age   <- fit_age_sum$r.squared
+
+  # Summary distribution of the per-sample fraction (helps justify using a fixed fraction)
+  frac_summ <- panel_exome_df |>
+    summarize(
+      mean_frac   = mean(percentageInPanel, na.rm = TRUE),
+      median_frac = median(percentageInPanel, na.rm = TRUE),
+      sd_frac     = sd(percentageInPanel, na.rm = TRUE),
+      iqr_frac    = IQR(percentageInPanel, na.rm = TRUE),
+      min_frac    = min(percentageInPanel, na.rm = TRUE),
+      max_frac    = max(percentageInPanel, na.rm = TRUE)
+    )
+
+  list(
+    n_samples = n_samples,
+    n_sources = n_sources,
+    exomePanelCorrection = exomePanelCorrection,
+    frac_summary = frac_summ,
+    panel_vs_exome_cor = list(
+      estimate = unname(cor_test$estimate),
+      conf_int = cor_test$conf.int,
+      p_value  = cor_test$p.value
+    ),
+    age_effect_on_fraction = list(
+      beta_per_year = beta_age,
+      se = se_age,
+      p_value = p_age,
+      r_squared = r2_age
+    )
+  )
+
+  ## 3) Plot
+  pExomeToPanelFraction <- panel_exome_df |>
+    ggplot(aes(x = Age, y = percentageInPanel, fill = source, colour = source)) +
+    geom_point() +
+    geom_smooth(method = "lm") +
+    scale_colour_manual(values = dataset_colours) +
+    scale_fill_manual(values = dataset_colours) +
+    scale_y_continuous(labels = scales::percent, limits = c(0, NA)) +
+    ylab("% of exome-wide likely disease\nvariants in 220-gene panel") +
+    theme_pubr() +
+    theme(
+      legend.position = c(0.8, 0.8),
+      legend.title = element_blank()
+    )
+} else {
+  exomePanelCorrection <- twinsUK_exomePanelCorrection_stats$exomePanelCorrection
+  print(twinsUK_exomePanelCorrection_stats)
+
+  # No DD-father points exist for this comparison - show the TwinsUK fitted
+  # trend only (Age grid + CI, no individual points).
+  exomeFractionFitTUK <- predict_from_fit_table(twinsUK_vafFits, "percentageInPanel_exomeCorrection", age_grid_fine$Age)
+  pExomeToPanelFraction <- ggplot(exomeFractionFitTUK, aes(x = Age, y = fit)) +
+    geom_ribbon(aes(ymin = ci_lo, ymax = ci_hi), fill = dataset_colours[["Controls"]], alpha = 0.25) +
+    geom_line(colour = dataset_colours[["Controls"]], linewidth = 1.1) +
+    scale_y_continuous(labels = scales::percent, limits = c(0, NA)) +
+    ylab("% of exome-wide likely disease\nvariants in 220-gene panel\n(TwinsUK fit only - see README)") +
+    theme_pubr()
+}
+
+pExomeToPanelFraction
+
+```
+
+#### German vs TwinsUK
+TwinsUK VAF sums are individual-level and controlled-access (see README). The
+plots below use vafSumsVars (DD/Apert fathers) points directly; the TwinsUK
+trend line comes from either the live tukVafSums fit (twinsUKDataAvailable) or
+the pre-computed aggregate fit (data/twinsUK_vafFits.tsv) - never TwinsUK's
+individual points. The superseded naive-scaling VafSumAdjusted43 draft (using a
+flat 1/exomePanelCorrection multiplier instead of the age-adjusted TwinsUK
+model) has been dropped - only the final, age-adjusted version is built below.
+```{r germanTwinVaf}
+
+likelyDiseaseBase <- vafSumsVars |> filter(source != "Apert fathers", vafGroup == "likelyDisease")
+if (twinsUKDataAvailable) likelyDiseaseBase <- bind_rows(likelyDiseaseBase, tukVafSums |> filter(vafGroup == "likelyDisease"))
+
+pVafSumLikelyDisease <- likelyDiseaseBase |>
+  ggplot(aes(x = Age, y = vafSum, colour = source, fill = source)) +
+  geom_point(size = 2) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, NA)) +
+  ylab("% of sperm with likely disease mutation\n(220 gene panel; no mosaics)") +
+  xlab('Age (years)') +
+  scale_colour_manual(values = dataset_colours) +
+  scale_fill_manual(values = dataset_colours) +
+  stat_smooth(method = "lm", formula = 'y ~ x') +
+  theme_pubr() +
+  theme(strip.background = element_blank(),
+        legend.title = element_blank(),
+        legend.position = c(0.2, 0.85),
+        plot.title = element_text(hjust = 0.5, size = 10))
+
+if (!twinsUKDataAvailable) {
+  likelyDiseaseFitTUK <- predict_from_fit_table(twinsUK_vafFits, "vafSum_likelyDisease", seq(min(likelyDiseaseBase$Age), max(likelyDiseaseBase$Age), by = 1))
+  pVafSumLikelyDisease <- pVafSumLikelyDisease +
+    geom_ribbon(data = likelyDiseaseFitTUK, aes(x = Age, ymin = ci_lo, ymax = ci_hi, fill = "Controls"), inherit.aes = FALSE, alpha = 0.25) +
+    geom_line(data = likelyDiseaseFitTUK, aes(x = Age, y = fit, colour = "Controls"), inherit.aes = FALSE, linewidth = 1.1)
+}
+pVafSumLikelyDisease
+
+likelyDiseaseBaseApert <- vafSumsVars |> filter(vafGroup == "likelyDisease")
+if (twinsUKDataAvailable) likelyDiseaseBaseApert <- bind_rows(likelyDiseaseBaseApert, tukVafSums |> filter(vafGroup == "likelyDisease"))
+
+pVafSumLikelyDiseaseApert <- likelyDiseaseBaseApert |>
+  ggplot(aes(x = Age, y = vafSum, colour = source, fill = source)) +
+  geom_point(size = 2) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, NA)) +
+  ylab("% of sperm with likely disease mutation\n(220 gene panel; no mosaics)") +
+  xlab('Age (years)') +
+  scale_colour_manual(values = dataset_colours) +
+  scale_fill_manual(values = dataset_colours) +
+  stat_smooth(method = "lm", formula = 'y ~ x') +
+  theme_pubr() +
+  theme(strip.background = element_blank(),
+        legend.title = element_blank(),
+        legend.position = c(0.2, 0.85),
+        plot.title = element_text(hjust = 0.5, size = 10))
+
+if (!twinsUKDataAvailable) {
+  likelyDiseaseFitTUKApert <- predict_from_fit_table(twinsUK_vafFits, "vafSum_likelyDisease", seq(min(likelyDiseaseBaseApert$Age), max(likelyDiseaseBaseApert$Age), by = 1))
+  pVafSumLikelyDiseaseApert <- pVafSumLikelyDiseaseApert +
+    geom_ribbon(data = likelyDiseaseFitTUKApert, aes(x = Age, ymin = ci_lo, ymax = ci_hi, fill = "Controls"), inherit.aes = FALSE, alpha = 0.25) +
+    geom_line(data = likelyDiseaseFitTUKApert, aes(x = Age, y = fit, colour = "Controls"), inherit.aes = FALSE, linewidth = 1.1)
+}
+pVafSumLikelyDiseaseApert
+
+# Fit linear model to twinsUK data (or use the pre-computed fit)
+if (twinsUKDataAvailable) {
+  twins_model <- lm(exome_vafSum ~ Age, data = tukVafSums |> filter(vafGroup == "likelyDisease"))
+}
+
+# Add age-based prediction for German data
+german_adjusted <- vafSumsVars |>
+  filter(vafGroup == "likelyDisease") |>
+  mutate(twinsUK_pred = if (twinsUKDataAvailable) predict(twins_model, newdata = cur_data())
+                        else predict_from_fit_table(twinsUK_vafFits, "exome_vafSum_likelyDisease", Age)$fit,
+         adjustment_factor = twinsUK_pred * 0.565,
+         exome_vafSum = vafSum + adjustment_factor,
+         exome_countSum = round(countSum * (1/exomePanelCorrection)))
+
+# VafSumAdjusted43 is DD fathers + Apert fathers only unless twinsUKDataAvailable
+VafSumAdjusted43 <- german_adjusted
+if (twinsUKDataAvailable) VafSumAdjusted43 <- bind_rows(VafSumAdjusted43, tukVafSums |> filter(vafGroup == "likelyDisease"))
+
+pVafSumAdjusted43 <- VafSumAdjusted43 |>
+  ggplot(aes(x = Age, y = exome_vafSum, colour = source, fill = source)) +
+  geom_point(size = 2) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, NA)) +
+  ylab("% of sperm with likely disease mutation") +
+  xlab('Age (years)') +
+  scale_colour_manual(values = dataset_colours) +
+  scale_fill_manual(values = dataset_colours) +
+  stat_smooth(method = "lm", formula = 'y ~ x') +
+  theme_pubr() +
+  theme(strip.background = element_blank(),
+        legend.title = element_blank(),
+        legend.position = c(0.2, 0.85),
+        plot.title = element_text(hjust = 0.5, size = 10))
+
+if (!twinsUKDataAvailable) {
+  exomeVafFitTUK <- predict_from_fit_table(twinsUK_vafFits, "exome_vafSum_likelyDisease", seq(min(VafSumAdjusted43$Age), max(VafSumAdjusted43$Age), by = 1))
+  pVafSumAdjusted43 <- pVafSumAdjusted43 +
+    geom_ribbon(data = exomeVafFitTUK, aes(x = Age, ymin = ci_lo, ymax = ci_hi, fill = "Controls"), inherit.aes = FALSE, alpha = 0.25) +
+    geom_line(data = exomeVafFitTUK, aes(x = Age, y = fit, colour = "Controls"), inherit.aes = FALSE, linewidth = 1.1)
+}
+pVafSumAdjusted43
+
+```
+
+##### Figure 3 
+```{r germanTwinFig3, fig.height=8, fig.width=11}
+
+# --- 1) Prepare mosaic variant info ---
+mosaicVars <- diagnosticVarsCalls |> 
+  filter(varLabel != "") |> 
+  left_join(spermSamplesFiltered |> select(Sample_PD_ID, FAM_ID, Age)) |> 
+  select(Sample_PD_ID, Age, mosaic_vaf = duplexVAF) |> 
+  distinct() |> 
+  filter(mosaic_vaf > 0.005)
+
+# --- 2) Age-based adjustment & combined frame ---
+if (twinsUKDataAvailable) {
+  twins_model <- lm(exome_vafSum ~ Age, data = tukVafSums |> filter(vafGroup == "likelyDisease"))
+}
+
+german_adjusted <- vafSumsVars |>
+  filter(vafGroup == "likelyDisease") |>
+  mutate(
+    twinsUK_pred = if (twinsUKDataAvailable) predict(twins_model, newdata = cur_data())
+                   else predict_from_fit_table(twinsUK_vafFits, "exome_vafSum_likelyDisease", Age)$fit,
+    adjustment_factor = twinsUK_pred * (1 - exomePanelCorrection),
+    exome_vafSum = vafSum + adjustment_factor
+  )
+
+
+# --- 3) Build mosaic points (base + mosaic totals) ---
+originalPoints <- VafSumAdjusted43 |> 
+  semi_join(mosaicVars, by = "Sample_PD_ID") |> 
+  select(Sample_PD_ID, exome_vafSum, source)
+
+mosaicPoints <- originalPoints |> 
+  left_join(mosaicVars |> select(Sample_PD_ID, mosaic_vaf, Age), by = "Sample_PD_ID") |> 
+  mutate(
+    mosaic_total_vaf = exome_vafSum + mosaic_vaf,
+    label = paste0(scales::percent(mosaic_vaf, accuracy = 0.1), " mosaic\n", scales::percent(exome_vafSum, accuracy = 0.1), " other"),
+    source_display = case_when(
+      source == "twinsUK" ~ "Controls",
+      source == "germanTrio" ~ "DD fathers",
+      TRUE ~ source
+    )
+  ) 
+
+# --- 4) Split datasets for plotting & legend entries ---
+mosaic_ids <- mosaicPoints |> distinct(Sample_PD_ID) |> pull()
+
+# Non-mosaic data only (exclude the 4 mosaic fathers); recode for legend
+base_non_mosaic0 <- VafSumAdjusted43 |>
+  filter(!(Sample_PD_ID %in% mosaic_ids)) |>
+  mutate(source_display = source)
+
+# Mosaic fathers: base exome (without mosaic)
+mosaic_without <- VafSumAdjusted43 |>
+  semi_join(mosaicVars, by = "Sample_PD_ID") |>
+  select(Sample_PD_ID, Age, exome_vafSum) |>
+  mutate(source_display = "Mosaic DD fathers - other")
+
+# Mosaic fathers: exome + mosaic (total)
+mosaic_with <- mosaicPoints |>
+  transmute(Sample_PD_ID, Age,
+            exome_vafSum = mosaic_total_vaf,
+            label,
+            source_display = "Mosaic DD fathers - total")
+
+# --- 5) Scales (extend the palette with two new legend items) ---
+legend_order <- c("Controls",
+                  "DD fathers",
+                  "Apert fathers",
+                  "Mosaic DD fathers - other",
+                  "Mosaic DD fathers - total")
+
+col_values  <- c(dataset_colours,
+                 "Mosaic DD fathers - other" = "black",
+                 "Mosaic DD fathers - total" = "black")
+
+fill_values <- c(dataset_colours,
+                 "Mosaic DD fathers - other" = "#ef8a62",
+                 "Mosaic DD fathers - total" = "goldenrod2")
+
+# Ensure legend order by setting factors (optional but robust)
+base_non_mosaic <- base_non_mosaic0  |> mutate(source_display = factor(source_display, levels = legend_order)) |> filter(source != "Apert fathers")
+base_non_mosaicApert <- base_non_mosaic0  |> mutate(source_display = factor(source_display, levels = legend_order))
+
+mosaic_without  <- mosaic_without  |> mutate(source_display = factor(source_display, levels = legend_order))
+mosaic_with     <- mosaic_with     |> mutate(source_display = factor(source_display, levels = legend_order)) 
+
+normal_lbl <- mosaic_with |> dplyr::filter(!(Sample_PD_ID %in% c("PD63917c_tds0001", "PD63954c_tds0001", "PD63911c_tds0001", "PD68787b_tds0001", "PD68809b_tds0001")))
+nudge_lbl  <- mosaic_with |> dplyr::filter(Sample_PD_ID %in% "PD63917c_tds0001")
+right_lbl  <- mosaic_with |> dplyr::filter(Sample_PD_ID %in% c("PD63954c_tds0001", "PD63911c_tds0001"))
+bottom_lbl  <- mosaic_with |> dplyr::filter(Sample_PD_ID %in% c("PD68787b_tds0001", "PD68809b_tds0001"))
+# --- 6) Plot ---
+pVafSumAdjusted43 <- ggplot() +
+  # Non-mosaic controls & DD fathers
+  geom_point(data = base_non_mosaic,
+             aes(x = Age, y = exome_vafSum,
+                 colour = source_display, fill = source_display),
+             size = 2) +
+  stat_smooth(data = base_non_mosaic,
+              aes(x = Age, y = exome_vafSum, colour = source_display, fill = source_display),
+              method = "lm", formula = y ~ x) +
+  # Dotted up-ticks for mosaic fathers
+  geom_segment(data = mosaicPoints,
+               aes(x = Age, xend = Age,
+                   y = exome_vafSum, yend = mosaic_total_vaf),
+               linetype = "dotted", colour = "black",
+               inherit.aes = FALSE, show.legend = FALSE) +
+  # Mosaic fathers: base exome (without mosaic)
+  geom_point(data = mosaic_without,
+             aes(x = Age, y = exome_vafSum,
+                 colour = source_display, fill = source_display),
+             shape = 21, size = 2, stroke = 0.75) +
+  # Mosaic fathers: exome + mosaic (total)
+  geom_point(data = mosaic_with,
+             aes(x = Age, y = exome_vafSum,
+                 colour = source_display, fill = source_display),
+             shape = 21, size = 2, stroke = 0.75) +
+  # Labels for mosaic increment
+  geom_label_repel(
+    data = normal_lbl,
+    aes(x = Age, y = exome_vafSum, label = label),
+    fill = "white", colour = "black", size = 3,
+    label.size = 0.25, inherit.aes = FALSE,
+    hjust = 0.5, direction = "x", nudge_x = -4,
+    min.segment.length = 0, show.legend = FALSE) +
+  geom_label_repel(
+    data = right_lbl,
+    aes(x = Age, y = exome_vafSum, label = label),
+    fill = "white", colour = "black", size = 3,
+    label.size = 0.25, inherit.aes = FALSE,
+    hjust = 0.5, direction = "x", nudge_x = 4,
+    min.segment.length = 0, show.legend = FALSE) +
+  geom_label_repel(
+    data = nudge_lbl,
+    aes(x = Age, y = exome_vafSum, label = label),
+    fill = "white", colour = "black", size = 3,
+    label.size = 0.25, inherit.aes = FALSE,
+    hjust = 0.5, direction = "x", nudge_x = -12,
+    min.segment.length = 0, show.legend = FALSE) +
+  geom_label_repel(
+    data = bottom_lbl,
+    aes(x = Age, y = exome_vafSum, label = label),
+    fill = "white", colour = "black", size = 3,
+    label.size = 0.25, inherit.aes = FALSE,
+    hjust = 0.5, direction = "y", 
+    nudge_y = -1,   # or -1, -5, etc. depending on exome_vafSum scale
+    min.segment.length = 0, show.legend = FALSE
+  ) +
+  # Axes & theme
+  scale_y_continuous(labels = scales::percent, limits = c(0, NA)) +
+  ylab("% of sperm with likely disease mutation") +
+  xlab("Age (years)") +
+  scale_colour_manual(values = col_values, breaks = legend_order, name = NULL) +
+  scale_fill_manual(values = fill_values, breaks = legend_order, name = NULL) +
+  theme_pubr() +
+  theme(
+    strip.background = element_blank(),
+    legend.title = element_blank(),
+    legend.position = c(0.7, 0.85),
+    plot.title = element_text(hjust = 0.5, size = 10)
+  )
+
+if (!twinsUKDataAvailable) {
+  exomeVafFitTUKFig3 <- predict_from_fit_table(twinsUK_vafFits, "exome_vafSum_likelyDisease", seq(min(base_non_mosaic$Age), max(base_non_mosaic$Age), by = 1))
+  pVafSumAdjusted43 <- pVafSumAdjusted43 +
+    geom_ribbon(data = exomeVafFitTUKFig3, aes(x = Age, ymin = ci_lo, ymax = ci_hi, fill = "Controls"), inherit.aes = FALSE, alpha = 0.25) +
+    geom_line(data = exomeVafFitTUKFig3, aes(x = Age, y = fit, colour = "Controls"), inherit.aes = FALSE, linewidth = 1.1)
+}
+
+pVafSumAdjusted43
+
+# --- 6) Plot ---
+pVafSumAdjusted43Apert <- ggplot() +
+  # Non-mosaic controls & DD fathers
+  geom_point(data = base_non_mosaicApert,
+             aes(x = Age, y = exome_vafSum,
+                 colour = source_display, fill = source_display),
+             size = 2) +
+  stat_smooth(data = base_non_mosaicApert,
+              aes(x = Age, y = exome_vafSum, colour = source_display, fill = source_display),
+              method = "lm", formula = y ~ x) +
+  # Dotted up-ticks for mosaic fathers
+  geom_segment(data = mosaicPoints,
+               aes(x = Age, xend = Age,
+                   y = exome_vafSum, yend = mosaic_total_vaf),
+               linetype = "dotted", colour = "black",
+               inherit.aes = FALSE, show.legend = FALSE) +
+  # Mosaic fathers: base exome (without mosaic)
+  geom_point(data = mosaic_without,
+             aes(x = Age, y = exome_vafSum,
+                 colour = source_display, fill = source_display),
+             shape = 21, size = 2, stroke = 0.75) +
+  # Mosaic fathers: exome + mosaic (total)
+  geom_point(data = mosaic_with,
+             aes(x = Age, y = exome_vafSum,
+                 colour = source_display, fill = source_display),
+             shape = 21, size = 2, stroke = 0.75) +
+  # Labels for mosaic increment
+  geom_label_repel(
+    data = normal_lbl,
+    aes(x = Age, y = exome_vafSum, label = label),
+    fill = "white", colour = "black", size = 3,
+    label.size = 0.25, inherit.aes = FALSE,
+    # hjust = 0.5, direction = "x", nudge_x = -4,
+    min.segment.length = 0, show.legend = FALSE) +
+  geom_label_repel(
+    data = right_lbl,
+    aes(x = Age, y = exome_vafSum, label = label),
+    fill = "white", colour = "black", size = 3,
+    label.size = 0.25, inherit.aes = FALSE,
+    hjust = 0.5, direction = "x", nudge_x = 4,
+    min.segment.length = 0, show.legend = FALSE) +
+  geom_label_repel(
+    data = nudge_lbl,
+    aes(x = Age, y = exome_vafSum, label = label),
+    fill = "white", colour = "black", size = 3,
+    label.size = 0.25, inherit.aes = FALSE,
+    hjust = 0.5, direction = "x", nudge_x = -12,
+    min.segment.length = 0, show.legend = FALSE) +
+  # Axes & theme
+  scale_y_continuous(labels = scales::percent, limits = c(0, NA)) +
+  ylab("% of sperm with likely disease mutation") +
+  xlab("Age (years)") +
+  scale_colour_manual(values = col_values, breaks = legend_order, name = NULL) +
+  scale_fill_manual(values = fill_values, breaks = legend_order, name = NULL) +
+  theme_pubr() +
+  theme(
+    strip.background = element_blank(),
+    legend.title = element_blank(),
+    legend.position = c(0.7, 0.85),
+    plot.title = element_text(hjust = 0.5, size = 10)
+  )
+
+if (!twinsUKDataAvailable) {
+  exomeVafFitTUKFig3Apert <- predict_from_fit_table(twinsUK_vafFits, "exome_vafSum_likelyDisease", seq(min(base_non_mosaicApert$Age), max(base_non_mosaicApert$Age), by = 1))
+  pVafSumAdjusted43Apert <- pVafSumAdjusted43Apert +
+    geom_ribbon(data = exomeVafFitTUKFig3Apert, aes(x = Age, ymin = ci_lo, ymax = ci_hi, fill = "Controls"), inherit.aes = FALSE, alpha = 0.25) +
+    geom_line(data = exomeVafFitTUKFig3Apert, aes(x = Age, y = fit, colour = "Controls"), inherit.aes = FALSE, linewidth = 1.1)
+}
+
+pVafSumAdjusted43Apert
+
+pdf(paste0(outputPath, 'Fig3_Mosaic.pdf'), height = 5, width = 8, onefile = F)
+pVafSumAdjusted43
+dev.off()
+
+```
+
+##### SupFig 6
+```{r extfig2, fig.height=12, fig.width=16}
+
+layoutFigApert <- "
+AC
+BC"
+
+(snv_plotApert +  labs(tag = "A") + indel_plotApert +  labs(tag = "B") + ((pDomains +  labs(tag = "C"))/trinucDNM/trinucSperm/trinucApert + plot_layout(heights = c(1, 15, 15, 15))) +  plot_layout(design = layoutFigApert , widths = c(1,1.5)))/ (p_vafSumsGenesDriverApert +  labs(tag = "D") + pVafSumLikelyDiseaseApert +  labs(tag = "E")) + plot_layout(heights = c(2,1), nrow = 2) & theme(plot.tag = element_text(size = 14, face = "bold"))
+
+pdf(paste0(outputPath, 'SupFig6_Apert.pdf'), height = 12, width = 16, onefile = F)
+(snv_plotApert +  labs(tag = "A") + indel_plotApert +  labs(tag = "B") + ((pDomains +  labs(tag = "C"))/trinucDNM/trinucSperm/trinucApert + plot_layout(heights = c(1, 15, 15, 15))) +  plot_layout(design = layoutFigApert , widths = c(1,1.5)))/ (p_vafSumsGenesDriverApert +  labs(tag = "D") + pVafSumLikelyDiseaseApert+  labs(tag = "E")) + plot_layout(heights = c(2,1), nrow = 2) & theme(plot.tag = element_text(size = 14, face = "bold"))
+dev.off()
+```
+
+## f) Early mosaic rates
+### Published data sets
+```{r mosaicSources, fig.width=10, fig.height=6}
+
+mosaicVarsAnnot <- read_tsv(paste0(dataPath, "mosaicVarsAnnot.tsv"), col_types = cols())
+mosaicVarsAnnot |> group_by(set, ID) |> summarise(count = n()) |> summarize(mean = mean(count)) 
+
+mosaicVarsAnnot |> group_by(ID,set) |> summarise(count = n()) |> 
+  ggplot(aes(x = set, y = count)) +
+  geom_point() +
+  theme_pubr()
+
+mosaicVarsAnnot |> 
+  ggplot(aes(x = set, y = VAF, colour = set)) +
+  geom_boxplot() +
+  geom_jitter() +
+  theme_pubr()
+
+mosaicVarsAnnot |>
+  ggplot(aes(VAF, colour = set)) +
+  geom_density() +
+  theme_pubr()
+
+```
+
+#### Model expected 
+```{r mosaicModelExpected, fig.width=10, fig.height=6}
+# 1) Analytic expectation + Normal-approx CI
+perID_expect <- mosaicVarsAnnot |>
+  group_by(ID) |>
+  summarise(
+    n_variants = n(),
+    expected = sum(VAF),
+    variance = sum(VAF * (1 - VAF)),
+    .groups = "drop"
+  ) |>
+  mutate(
+    ci_low_norm  = pmax(0, qnorm(0.025, mean = expected, sd = sqrt(variance))),
+    ci_high_norm = pmin(n_variants, qnorm(0.975, mean = expected, sd = sqrt(variance)))
+  )
+
+# 2) Bootstrap Poisson-binomial CI (recommended, per individual)
+boot_ci_fun <- function(p, nsims = 20000L) {
+  if (length(p) == 0L) return(c(NA_real_, NA_real_))
+  mat <- matrix(runif(nsims * length(p)) < rep(p, each = nsims), nrow = nsims)
+  totals <- rowSums(mat)
+  as.numeric(quantile(totals, c(0.025, 0.975)))
+}
+
+set.seed(1)
+perID_boot <- mosaicVarsAnnot |>
+  group_by(ID) |>
+  summarise(
+    ci = list(boot_ci_fun(VAF, nsims = 20000L)),
+    .groups = "drop"
+  ) |>
+  mutate(
+    ci_low  = purrr::map_dbl(ci, 1),
+    ci_high = purrr::map_dbl(ci, 2)
+  ) |>
+  select(-ci)
+
+# Combine per-ID results
+perID_results <- perID_expect |>
+  left_join(perID_boot, by = "ID") |>
+  select(ID, n_variants, expected,
+         ci_low, ci_high,         # bootstrap CI
+         ci_low_norm, ci_high_norm)  # normal-approx CI (for reference)
+
+# Bootstrap helper for mean
+boot_mean_ci <- function(x, nsims = 20000L) {
+  means <- replicate(nsims, mean(sample(x, replace = TRUE)))
+  as.numeric(quantile(means, c(0.025, 0.975)))
+}
+
+set.seed(1)
+mean_expected_ci <- boot_mean_ci(perID_results$expected)
+mean_variants_ci <- boot_mean_ci(perID_results$n_variants)
+
+overall_individual <- tibble(
+  ID = "Whole genome",
+  n_variants = mean(perID_results$n_variants),
+  ci_low_n_variants     = mean_variants_ci[1],
+  ci_high_n_variants    = mean_variants_ci[2],
+  expected_transmitted   = mean(perID_results$expected)*2,
+  ci_low_transmitted  = mean_expected_ci[1]*2,
+  ci_high_transmitted = mean_expected_ci[2]*2
+)
+
+# Final table with per-ID + average
+perID_with_avg <- bind_rows(perID_results, overall_individual)
+
+# Plot per-ID expected values
+ggplot(perID_results, aes(x = reorder(ID, expected), y = expected)) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0.2) +
+  coord_flip() +
+  labs(
+    x = "Individual (ID)",
+    y = "Expected transmitted variants (95% CI)"
+  )
+
+perID_with_avg
+
+
+paternal_fraction=0.794
+maternal_fraction=0.206
+paternal_ss_rate=0.0104
+maternal_ss_rate=0.0454
+dnms_per_child=68.7
+expected_fraction=paternal_fraction*paternal_ss_rate+maternal_fraction*maternal_ss_rate
+dnms_per_child*expected_fraction
+dnms_per_child*paternal_fraction*paternal_ss_rate
+dnms_per_child*maternal_fraction*maternal_ss_rate
+expected_fraction
+
+#Risk in goriely paper
+1/((0.23 + 8 + 6 + 12.1)/100/59)
+```
+
+#### Mosaic carrier estimate:
+##### In cohort
+```{r mosaic}
+# Number of fathers
+n_total <- 127
+
+mosaicVAF <- diagnosticVarsCalls |> 
+  filter(duplexVAF > 0.001 & duplexCalls > 1) |> 
+  mutate(mosaicCount = 1)  |> 
+  mutate(source = "DD fathers") |> 
+  select(FAM_ID, source, mosaicVAF = duplexVAF, mosaicCount) |> 
+  left_join(spermSamplesFiltered |> select(FAM_ID, Sample_PD_ID), by = join_by(FAM_ID))
+
+# Create full VAF vector (6 mosaic VAFs + zeros for the rest)
+all_vafs <- c(mosaicVAF$mosaicVAF,
+              rep(0, n_total - length(mosaicVAF$mosaicVAF)))
+
+# Point estimate
+mean_vaf <- mean(all_vafs)
+one_in_estimate <- 1 / mean_vaf
+
+# Bootstrap CI
+set.seed(1)
+B <- 10000
+
+boot_one_in <- replicate(B, {
+  boot_mean <- mean(sample(all_vafs, replace = TRUE))
+  1 / boot_mean
+})
+
+one_in_ci <- quantile(boot_one_in, c(0.025, 0.975))
+
+list(
+  one_in_estimate = one_in_estimate,
+  one_in_CI = one_in_ci
+)
+
+```
+
+##### After SCN1A exclusion
+```{r scn1a_mosaic}
+# Re-run the in-cohort mosaic estimate excluding SCN1A-ascertained sperm samples.
+# mosaicVAF is keyed by Sample_PD_ID, so filtering is direct.
+dd_all_ids   <- VafSumAdjusted43 |> filter(source == "DD fathers") |> pull(Sample_PD_ID)
+dd_nonscn_ids <- setdiff(dd_all_ids, scn1a_sperm_ids)
+run_mosaic_estimate <- function(mosaic_df, n_total, label) {
+  all_vafs <- c(mosaic_df$mosaicVAF, rep(0, n_total - nrow(mosaic_df)))
+  mean_vaf <- mean(all_vafs)
+  set.seed(1)
+  boot_one_in <- replicate(10000, {
+    1 / mean(sample(all_vafs, replace = TRUE))
+  })
+  tibble(
+    group         = label,
+    n_total       = n_total,
+    n_mosaic      = nrow(mosaic_df),
+    one_in        = round(1 / mean_vaf),
+    ci_low        = round(quantile(boot_one_in, 0.025)),
+    ci_high       = round(quantile(boot_one_in, 0.975))
+  )
+}
+
+mosaic_full   <- mosaicVAF
+mosaic_nonscn <- mosaicVAF |> filter(!Sample_PD_ID %in% scn1a_sperm_ids)
+n_nonscn      <- length(dd_nonscn_ids)
+
+bind_rows(
+  run_mosaic_estimate(mosaic_full,   n_total = 127,      label = "All DD fathers (manuscript)"),
+  run_mosaic_estimate(mosaic_nonscn, n_total = n_nonscn, label = "Non-SCN1A DD fathers")
+) |>
+  mutate(result = paste0("1 in ", one_in, " (95% CI: 1 in ", ci_high, " – 1 in ", ci_low, ")")) |>
+  select(group, n_total, n_mosaic, result) |>
+  print()
+```
+
+## g) Relative contributions
+### Cohort fractions
+```{r germanAge, fig.width=6, fig.height=5}
+# ------------------------------
+# Colors
+# ------------------------------
+plot_colors <- c(
+  "Rare (other)"   = "#1F77B4", # Blue (Middle)
+  "Rare (known driver)"    = "#6A3D9A", # Green (Top)
+  "Mosaic" = "#9E2A2B"  # Red (Overlay)
+)
+plot_colorsLegend <- c(
+  "Pathogenic (early mosaic)"          = "#9E2A2B",
+  "Pathogenic (known driver)"       = "#6A3D9A",
+  "Pathogenic (other rare variant)"    = "#1F77B4"
+)
+
+# ------------------------------
+# Input datasets
+# ------------------------------
+driverVAF <- vafSumsVars |>
+  filter(vafGroup == "posPath")
+if (twinsUKDataAvailable) driverVAF <- bind_rows(driverVAF, tukVafSums |> filter(vafGroup == "posPath"))
+driverVAF <- driverVAF |>
+  select(Sample_PD_ID, source, driverVAF = vafSum, driverCount = countSum)
+
+mosaicVAF <- diagnosticVarsCalls |>
+  filter(duplexVAF > 0.001 & duplexCalls > 1) |>
+  mutate(mosaicCount = 1)  |>
+  mutate(source = "DD fathers") |>
+  select(FAM_ID, source, mosaicVAF = duplexVAF, mosaicCount) |>
+  left_join(spermSamplesFiltered |> select(FAM_ID, Sample_PD_ID), by = join_by(FAM_ID))
+
+# ------------------------------
+# Cohort fractions with sample counts
+# ------------------------------
+cohortFraction <- VafSumAdjusted43 |>
+  select(Sample_PD_ID, source, exome_vafSum, exomeCount = exome_countSum) |>
+  left_join(driverVAF, by = join_by(Sample_PD_ID, source)) |>
+  left_join(mosaicVAF, by = join_by(Sample_PD_ID, source)) |>
+  mutate(otherVAF   = exome_vafSum - driverVAF,
+         otherCount = exomeCount - driverCount) |>
+  group_by(source) |>
+  summarise(driverVAF   = sum(driverVAF,   na.rm = TRUE),
+            driverCount = sum(driverCount, na.rm = TRUE),
+            otherVAF    = sum(otherVAF,    na.rm = TRUE),
+            otherCount  = sum(otherCount,  na.rm = TRUE),
+            mosaicVAF   = sum(mosaicVAF,   na.rm = TRUE),
+            mosaicCount = sum(mosaicCount, na.rm = TRUE),
+            n_samples   = n_distinct(Sample_PD_ID),
+            .groups = "drop") |>
+  mutate(totalVAF = driverVAF + otherVAF + mosaicVAF) |>
+  mutate(across(c(driverVAF, otherVAF, mosaicVAF), ~ .x / totalVAF)) |>
+  pivot_longer(cols = c(driverVAF, otherVAF, mosaicVAF),
+               names_to = "vafType",
+               values_to = "vafProp") |>
+  mutate(count = case_when(
+    vafType == "driverVAF" ~ driverCount,
+    vafType == "otherVAF"  ~ otherCount,
+    vafType == "mosaicVAF" ~ mosaicCount
+  )) |>
+  mutate(vafType = recode(vafType,
+                          driverVAF = "Rare (known driver)",
+                          otherVAF  = "Rare (other)",
+                          mosaicVAF = "Mosaic")) |>
+  mutate(source_label = paste0(source, "\n", "(n=", n_samples, ")"))
+
+# TwinsUK "Controls" is under controlled access - see README. The saved values
+# (data/twinsUK_cohortFraction.tsv) are already a pure aggregate - proportions
+# and counts summed across the whole TwinsUK cohort, no individual data - added
+# back in only when the live data isn't available.
+if (!twinsUKDataAvailable) {
+  cohortFraction <- bind_rows(
+    cohortFraction,
+    read_tsv(paste0(dataPath, "twinsUK_cohortFraction.tsv"), col_types = cols()) |>
+      mutate(source_label = paste0(source, "\n", "(n=", n_samples, ")"))
+  )
+}
+
+cohortFraction <- cohortFraction |>
+  mutate(source_label = fct_relevel(source_label,
+                                    "DD fathers\n(n=127)",
+                                    "Apert fathers\n(n=8)",
+                                    "Controls\n(n=36)")) |>
+  filter(vafProp != 0)
+
+# ------------------------------
+# Plot
+# ------------------------------
+p_cohortFraction <- ggplot(cohortFraction,
+       aes(x = source_label, y = vafProp, fill = vafType)) +
+  geom_col(color = "black") +
+  geom_label(
+    aes(label = paste0("vars = ", count), group = vafType),
+    position = position_stack(vjust = 0.5),
+    fill = "white", color = "black", size = 3, label.size = 0
+  ) +
+  scale_fill_manual(values = plot_colors) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(x = NULL, y = "Proportion of disease mutation VAF",
+       fill = "Disease mutation class") +
+  theme_pubr() +
+  theme(
+        legend.position = "none",
+        axis.line.x = element_blank())+
+  guides(fill = guide_legend(direction = "vertical"))
+
+p_cohortFraction
+
+
+```
+
+#### Cohort fractions — DD fathers back-inferred to age of conception
+```{r cohortFractionConception, fig.width=7, fig.height=5}
+# ------------------------------
+# Driver-specific TwinsUK age model (posPath vafGroup)
+# Fitted on panel vafSum so it is on the same scale as driverVAF (also panel posPath).
+# Used to derive per-sample driver scale factors independently of the ClinDDlofCADD model.
+# ------------------------------
+if (twinsUKDataAvailable) {
+  twins_model_driver <- lm(vafSum ~ Age, data = tukVafSums |> filter(vafGroup == "posPath"))
+}
+
+# ------------------------------
+# All DD father samples shifted by the cohort mean paternal age gap.
+# ClinDDlofCADD rate scales overall panel burden; posPath rate scales driver VAFs.
+# Mosaic VAF unchanged. exome_countSum is count-based and does not scale with age.
+# ------------------------------
+mean_age_gap <- mean(burdenComp$paternalAgeGap)
+
+dd_at_conception <- german_adjusted |>
+  filter(source == "DD fathers") |>
+  mutate(
+    Age_conception    = Age - mean_age_gap,
+    twinsUK_pred_conc = if (twinsUKDataAvailable) predict(twins_model, newdata = data.frame(Age = Age_conception))
+                        else predict_from_fit_table(twinsUK_vafFits, "exome_vafSum_likelyDisease", Age_conception)$fit,
+    age_scale_factor  = twinsUK_pred_conc / twinsUK_pred,
+    vafSum_conc       = vafSum * age_scale_factor,
+    exome_vafSum      = vafSum_conc + twinsUK_pred_conc * 0.565,
+    exome_countSum    = round(countSum * (1 / exomePanelCorrection)),
+    source            = "DD fathers (at conception)"
+  )
+
+# Driver VAFs scaled using the posPath-specific model rate
+driverVAF_conc <- driverVAF |>
+  filter(source == "DD fathers") |>
+  left_join(dd_at_conception |> select(Sample_PD_ID, Age, Age_conception), by = join_by(Sample_PD_ID)) |>
+  mutate(
+    driver_pred_obs     = if (twinsUKDataAvailable) predict(twins_model_driver, newdata = data.frame(Age = Age))
+                          else predict_from_fit_table(twinsUK_vafFits, "vafSum_posPath", Age)$fit,
+    driver_pred_conc    = if (twinsUKDataAvailable) predict(twins_model_driver, newdata = data.frame(Age = Age_conception))
+                          else predict_from_fit_table(twinsUK_vafFits, "vafSum_posPath", Age_conception)$fit,
+    driver_scale_factor = driver_pred_conc / driver_pred_obs,
+    driverVAF           = driverVAF * driver_scale_factor,
+    source              = "DD fathers (at conception)"
+  )
+
+# ------------------------------
+# Cohort fractions including the at-conception group
+# ------------------------------
+cohortFractionConception <- bind_rows(VafSumAdjusted43, dd_at_conception) |>
+  select(Sample_PD_ID, source, exome_vafSum, exomeCount = exome_countSum) |>
+  left_join(bind_rows(driverVAF, driverVAF_conc), by = join_by(Sample_PD_ID, source)) |>
+  left_join(mosaicVAF |> select(Sample_PD_ID, mosaicVAF, mosaicCount), by = join_by(Sample_PD_ID)) |>
+  mutate(otherVAF   = exome_vafSum - driverVAF,
+         otherCount = exomeCount - driverCount) |>
+  group_by(source) |>
+  summarise(driverVAF   = sum(driverVAF,   na.rm = TRUE),
+            driverCount = sum(driverCount, na.rm = TRUE),
+            otherVAF    = sum(otherVAF,    na.rm = TRUE),
+            otherCount  = sum(otherCount,  na.rm = TRUE),
+            mosaicVAF   = sum(mosaicVAF,   na.rm = TRUE),
+            mosaicCount = sum(mosaicCount, na.rm = TRUE),
+            n_samples   = n_distinct(Sample_PD_ID),
+            .groups = "drop") |>
+  mutate(totalVAF = driverVAF + otherVAF + mosaicVAF) |>
+  mutate(across(c(driverVAF, otherVAF, mosaicVAF), ~ .x / totalVAF)) |>
+  pivot_longer(cols = c(driverVAF, otherVAF, mosaicVAF),
+               names_to = "vafType",
+               values_to = "vafProp") |>
+  mutate(vafType = recode(vafType,
+                          driverVAF = "Rare (known driver)",
+                          otherVAF  = "Rare (other)",
+                          mosaicVAF = "Mosaic")) |>
+  mutate(source = factor(source, levels = c("DD fathers", "DD fathers (at conception)",
+                                            "Apert fathers", "Controls"))) |>
+  mutate(source_label = case_when(
+    source == "DD fathers" ~
+      paste0("DD fathers\nat sampling\n(n=", n_samples, ")"),
+    source == "DD fathers (at conception)" ~
+      paste0("DD fathers\nat conception\n(−", round(mean_age_gap, 1), " yrs, n=", n_samples, ")"),
+    TRUE ~ paste0(source, "\n(n=", n_samples, ")")
+  )) |>
+  mutate(source_label = fct_reorder(source_label, as.integer(source))) |>
+  filter(vafProp != 0)
+
+# ------------------------------
+# Sperm burden composition: observed vs mean-age-gap back-inferred conception
+# ------------------------------
+p_vafFractionConception <- cohortFractionConception |>
+  filter(source %in% c("DD fathers", "DD fathers (at conception)")) |>
+  ggplot(aes(x = source_label, y = vafProp, fill = vafType)) +
+  geom_col(color = "black") +
+  geom_label(
+    aes(label = paste0(round(vafProp * 100, 1), "%"), group = vafType),
+    position = position_stack(vjust = 0.5),
+    fill = "white", color = "black", size = 3, label.size = 0
+  ) +
+  scale_fill_manual(values = plot_colors) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(x = NULL, y = "Proportion of disease mutation VAF",
+       fill = "Disease mutation class") +
+  theme_pubr() +
+  theme(legend.position = "right",
+        axis.line.x = element_blank())
+
+p_vafFractionConception
+```
+
+#### Variant composition at conception: non-SCN1A cohort (n=110)
+```{r scn1a_composition_conception, fig.width=5, fig.height=5}
+# Regenerate the at-conception composition using only the 110 non-SCN1A DD fathers,
+# reusing twins_model, twins_model_driver and mean_age_gap defined above.
+
+dd_at_conception_110 <- german_adjusted |>
+  filter(source == "DD fathers", Sample_PD_ID %in% dd_nonscn_ids) |>
+  mutate(
+    Age_conception    = Age - mean_age_gap,
+    twinsUK_pred_conc = if (twinsUKDataAvailable) predict(twins_model, newdata = data.frame(Age = Age_conception))
+                        else predict_from_fit_table(twinsUK_vafFits, "exome_vafSum_likelyDisease", Age_conception)$fit,
+    age_scale_factor  = twinsUK_pred_conc / twinsUK_pred,
+    vafSum_conc       = vafSum * age_scale_factor,
+    exome_vafSum      = vafSum_conc + twinsUK_pred_conc * 0.565,
+    exome_countSum    = round(countSum * (1 / exomePanelCorrection)),
+    source            = "DD fathers (at conception)"
+  )
+
+driverVAF_conc_110 <- driverVAF |>
+  filter(source == "DD fathers", Sample_PD_ID %in% dd_nonscn_ids) |>
+  left_join(dd_at_conception_110 |> select(Sample_PD_ID, Age, Age_conception),
+            by = join_by(Sample_PD_ID)) |>
+  mutate(
+    driver_pred_obs     = if (twinsUKDataAvailable) predict(twins_model_driver, newdata = data.frame(Age = Age))
+                          else predict_from_fit_table(twinsUK_vafFits, "vafSum_posPath", Age)$fit,
+    driver_pred_conc    = if (twinsUKDataAvailable) predict(twins_model_driver, newdata = data.frame(Age = Age_conception))
+                          else predict_from_fit_table(twinsUK_vafFits, "vafSum_posPath", Age_conception)$fit,
+    driver_scale_factor = driver_pred_conc / driver_pred_obs,
+    driverVAF           = driverVAF * driver_scale_factor,
+    source              = "DD fathers (at conception)"
+  )
+
+# Sampling-time composition for n=110 (for direct comparison)
+dd_sampling_110 <- VafSumAdjusted43 |>
+  filter(source == "DD fathers", Sample_PD_ID %in% dd_nonscn_ids) |>
+  select(Sample_PD_ID, source, exome_vafSum, exomeCount = exome_countSum) |>
+  left_join(driverVAF |> filter(source == "DD fathers", Sample_PD_ID %in% dd_nonscn_ids),
+            by = join_by(Sample_PD_ID, source)) |>
+  left_join(mosaic_nonscn, by = join_by(Sample_PD_ID, source)) |>
+  mutate(otherVAF = exome_vafSum - driverVAF, otherCount = exomeCount - driverCount)
+
+conception_comp_110 <- bind_rows(
+  dd_sampling_110 |>
+    summarise(driverVAF   = sum(driverVAF,   na.rm = TRUE),
+              driverCount = sum(driverCount, na.rm = TRUE),
+              otherVAF    = sum(otherVAF,    na.rm = TRUE),
+              otherCount  = sum(otherCount,  na.rm = TRUE),
+              mosaicVAF   = sum(mosaicVAF,   na.rm = TRUE),
+              mosaicCount = sum(mosaicCount, na.rm = TRUE),
+              n_samples   = n_distinct(Sample_PD_ID)) |>
+    mutate(group = paste0("At sampling\n(n=", n_samples, ")")),
+  bind_rows(
+    dd_at_conception_110 |>
+      select(Sample_PD_ID, source, exome_vafSum, exomeCount = exome_countSum),
+  ) |>
+    left_join(driverVAF_conc_110, by = join_by(Sample_PD_ID, source)) |>
+    left_join(mosaic_nonscn, by = join_by(Sample_PD_ID)) |>
+    mutate(otherVAF = exome_vafSum - driverVAF, otherCount = exomeCount - driverCount) |>
+    summarise(driverVAF   = sum(driverVAF,   na.rm = TRUE),
+              driverCount = sum(driverCount, na.rm = TRUE),
+              otherVAF    = sum(otherVAF,    na.rm = TRUE),
+              otherCount  = sum(otherCount,  na.rm = TRUE),
+              mosaicVAF   = sum(mosaicVAF,   na.rm = TRUE),
+              mosaicCount = sum(mosaicCount, na.rm = TRUE),
+              n_samples   = n_distinct(Sample_PD_ID)) |>
+    mutate(group = paste0("At conception\n(−", round(mean_age_gap, 1), " yrs, n=", n_samples, ")"))
+) |>
+  mutate(totalVAF = driverVAF + otherVAF + mosaicVAF) |>
+  mutate(across(c(driverVAF, otherVAF, mosaicVAF), ~ .x / totalVAF)) |>
+  pivot_longer(cols = c(driverVAF, otherVAF, mosaicVAF),
+               names_to = "vafType", values_to = "vafProp") |>
+  mutate(count = case_when(
+    vafType == "driverVAF" ~ driverCount,
+    vafType == "otherVAF"  ~ otherCount,
+    vafType == "mosaicVAF" ~ mosaicCount
+  )) |>
+  mutate(vafType = recode(vafType,
+                          driverVAF = "Rare (known driver)",
+                          otherVAF  = "Rare (other)",
+                          mosaicVAF = "Mosaic"),
+         group = fct_inorder(group)) |>
+  filter(vafProp != 0)
+
+# Print proportions for results text
+cat("=== Composition at sampling and conception (non-SCN1A, n=110) ===\n")
+conception_comp_110 |>
+  select(group, vafType, vafProp) |>
+  mutate(vafProp = round(vafProp * 100, 1)) |>
+  print(n = Inf)
+
+ggplot(conception_comp_110, aes(x = group, y = vafProp, fill = vafType)) +
+  geom_col(colour = "black") +
+  geom_label(
+    aes(label = paste0(round(vafProp * 100, 1), "%"), group = vafType),
+    position = position_stack(vjust = 0.5),
+    fill = "white", colour = "black", size = 3, label.size = 0
+  ) +
+  scale_fill_manual(values = plot_colors) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(x = NULL, y = "Proportion of disease mutation VAF",
+       fill = "Disease mutation class") +
+  theme_pubr() +
+  theme(legend.position = "right", axis.line.x = element_blank(),
+        plot.title = element_text(size = 10))
+```
+
+##### SupFig 5
+```{r scn1a_supfig5, fig.height=5, fig.width=17}
+
+conception_comp_110_plot <- conception_comp_110 |>
+  mutate(source_label = str_replace(group, "At sampling",   "DD fathers\nat sampling") |>
+                        str_replace("At conception", "DD fathers\nat conception")) |>
+  mutate(source_label = fct_inorder(source_label)) |>
+  select(source_label, vafType, vafProp, count)
+
+p_vafFractionConception_110 <- p_vafFractionConception %+% conception_comp_110_plot
+
+supfig5_110 <- pVafSumLikelyDisease + pExomeToPanelFraction + p_vafFractionConception_110 +
+  plot_annotation(tag_levels = "A") &
+  theme(plot.tag = element_text(size = 14, face = "bold"))
+
+supfig5_110
+
+supfig5_110
+pdf(paste0(outputPath, "SupFig5_Path_nonSCN1A.pdf"),
+    height = 5, width = 17, onefile = FALSE)
+supfig5_110
+dev.off()
+```
+
+
+#### Rate increase with age
+```{r rateAge, fig.width=5, fig.height=10}
+
+# ------------------------------
+# Fit age models in TwinsUK exomes (or use the pre-computed fits - both are
+# already saved in twinsUK_vafFits.tsv as "exome_vafSum_posPath" and
+# "exome_vafSum_likelyDisease")
+# ------------------------------
+if (twinsUKDataAvailable) {
+  model_exome_posPath <- tukVafSums |>
+    filter(vafGroup == "posPath") |>
+    lm(exome_vafSum ~ Age, data = _)
+
+  model_exome_clin <- tukVafSums |>
+    filter(vafGroup == "likelyDisease") |>
+    lm(exome_vafSum ~ Age, data = _)
+}
+
+# ------------------------------
+# Compute stacked curves
+# ------------------------------
+Age_seq <- seq(0, 80, length.out = 100)
+newdat  <- tibble(Age = Age_seq)
+
+if (twinsUKDataAvailable) {
+  pred_posPath <- predict(model_exome_posPath, newdata = newdat)
+  pred_clin    <- predict(model_exome_clin,    newdata = newdat)
+} else {
+  pred_posPath <- predict_from_fit_table(twinsUK_vafFits, "exome_vafSum_posPath", Age_seq)$fit
+  pred_clin    <- predict_from_fit_table(twinsUK_vafFits, "exome_vafSum_likelyDisease", Age_seq)$fit
+}
+
+# Other = ClinLofDDCadd minus posPath (on the prediction scale)
+pred_other <- pmax(pred_clin - pred_posPath, 0)
+
+base_area_data <- tibble(
+  Age = Age_seq,
+  `Rare (known driver)` = pred_posPath,
+  `Rare (other)` = pred_other
+)
+
+make_area_data <- function(base, mosaic_value) {
+  base |>
+    mutate(`Mosaic` = mosaic_value) |>
+    pivot_longer(
+      cols = c(`Rare (known driver)`, `Rare (other)`, `Mosaic`),
+      names_to = "Category",
+      values_to = "Value"
+    ) |>
+    mutate(Category = fct_relevel(Category, "Rare (known driver)", "Rare (other)", "Mosaic"))
+}
+
+plot_data_nomosaic <- make_area_data(base_area_data, mosaic_value = 0)
+plot_data_mosaic5  <- make_area_data(base_area_data, mosaic_value = 0.05)
+
+# ------------------------------
+# Plots
+# ------------------------------
+plot_area_nomosaic <- ggplot(plot_data_nomosaic, aes(x = Age, y = Value, fill = Category)) +
+  geom_area(alpha = 0.8) +
+  scale_fill_manual(values = plot_colors) +
+  labs(y = "", x = "Age") +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 0.10)) +
+  xlim(20, 80) +
+  theme_pubr() + guides(fill = "none")
+
+plot_area_mosaic5 <- ggplot(plot_data_mosaic5, aes(x = Age, y = Value, fill = Category)) +
+  geom_area(alpha = 0.8) +
+  scale_fill_manual(values = plot_colors) +
+  labs(y = "                                        Theoretical risk of disease mutation", x = "Age") +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 0.10)) +
+  xlim(20, 80) +
+  theme_pubr() + guides(fill = "none")
+# ------------------------------
+# Combine plots
+# ------------------------------
+(plot_area_nomosaic / plot_area_mosaic5) +
+  plot_layout(guides = "collect")
+
+
+```
+
+#### Graphic
+```{r graphicPlot}
+
+img <- readPNG(paste0(dataPath, "GraphicFig4a_purple.png"))
+
+img_ratio <- dim(img)[1] / dim(img)[2]   # height / width
+
+p_graphic4a <- ggplot() +
+  annotation_custom(
+    rasterGrob(
+      img,
+      width  = unit(1, "npc"),
+      height = unit(1, "npc"),
+      interpolate = FALSE
+    ),
+    -Inf, Inf, -Inf, Inf
+  ) +
+  coord_fixed(ratio = img_ratio, expand = FALSE, clip = "off") +
+  theme_void() +
+  theme(
+    panel.background = element_rect(fill = "white", colour = NA),
+    plot.margin = margin(0, 0, 0, 0)
+  )
+p_graphic4a 
+```
+
+#### Legend
+```{r legendPlot}
+
+
+
+df_legend <- data.frame(
+  label = factor(names(plot_colorsLegend), levels = names(plot_colorsLegend)),
+  x = seq_along(plot_colorsLegend),
+  y = 1
+)
+
+legend_grob <- cowplot::get_legend(
+  ggplot(df_legend, aes(x = x, y = y, fill = label)) +
+    geom_tile(width = 0.9, height = 0.9) +
+    scale_fill_manual(values = plot_colorsLegend, name = NULL) +
+    guides(fill = guide_legend(
+      nrow = 1,
+      byrow = TRUE
+    )) +
+    theme_void() +
+    theme(
+      legend.text = element_text(size = 9),
+      legend.key.size = unit(0.5, "cm")
+    )
+)
+
+legend_plot <- patchwork::wrap_elements(panel = legend_grob)
+```
+
+### Variant composition: SCN1A exclusion
+#### Fig 4d composition: all vs SCN1A-only vs non-SCN1A
+```{r scn1a_composition, fig.width=6, fig.height=5}
+# Rebuild the cohortFraction stacked bar (Fig 4d style) for three DD father subgroups.
+# Uses the same VafSumAdjusted43 / driverVAF / mosaicVAF inputs as the main figure.
+
+
+
+build_cohort_frac <- function(ids, label) {
+  VafSumAdjusted43 |>
+    filter(source == "DD fathers", Sample_PD_ID %in% ids) |>
+    select(Sample_PD_ID, source, exome_vafSum, exomeCount = exome_countSum) |>
+    left_join(driverVAF |> filter(source == "DD fathers"),
+              by = join_by(Sample_PD_ID, source)) |>
+    left_join(mosaicVAF, by = join_by(Sample_PD_ID, source)) |>
+    mutate(otherVAF   = exome_vafSum - driverVAF,
+           otherCount = exomeCount   - driverCount) |>
+    summarise(driverVAF   = sum(driverVAF,   na.rm = TRUE),
+              driverCount = sum(driverCount, na.rm = TRUE),
+              otherVAF    = sum(otherVAF,    na.rm = TRUE),
+              otherCount  = sum(otherCount,  na.rm = TRUE),
+              mosaicVAF   = sum(mosaicVAF,   na.rm = TRUE),
+              mosaicCount = sum(mosaicCount, na.rm = TRUE),
+              n_samples   = n_distinct(Sample_PD_ID)) |>
+    mutate(source_label = paste0(label, "\n(n=", n_samples, ")"),
+           totalVAF     = driverVAF + otherVAF + mosaicVAF) |>
+    mutate(across(c(driverVAF, otherVAF, mosaicVAF), ~ .x / totalVAF)) |>
+    pivot_longer(cols = c(driverVAF, otherVAF, mosaicVAF),
+                 names_to = "vafType", values_to = "vafProp") |>
+    mutate(count = case_when(
+      vafType == "driverVAF" ~ driverCount,
+      vafType == "otherVAF"  ~ otherCount,
+      vafType == "mosaicVAF" ~ mosaicCount
+    )) |>
+    mutate(vafType = recode(vafType,
+                            driverVAF = "Rare (known driver)",
+                            otherVAF  = "Rare (other)",
+                            mosaicVAF = "Mosaic"))
+}
+
+comp_scn1a <- bind_rows(
+  build_cohort_frac(dd_all_ids,    "DD fathers (all)"),
+  build_cohort_frac(scn1a_sperm_ids, "SCN1A only"),
+  build_cohort_frac(dd_nonscn_ids, "Non-SCN1A")
+) |>
+  mutate(source_label = fct_inorder(source_label)) |>
+  filter(vafProp != 0)
+
+ggplot(comp_scn1a, aes(x = source_label, y = vafProp, fill = vafType)) +
+  geom_col(colour = "black") +
+  geom_label(
+    aes(label = paste0("vars = ", count), group = vafType),
+    position = position_stack(vjust = 0.5),
+    fill = "white", colour = "black", size = 3, label.size = 0
+  ) +
+  scale_fill_manual(values = plot_colors) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(x = NULL, y = "Proportion of disease mutation VAF",
+       fill = "Disease mutation class") +
+  theme_pubr() +
+  theme(legend.position = "right", axis.line.x = element_blank())
+```
+
+
+
+#### Figure 4 
+```{r scn1a_fig4d, fig.height=5, fig.width=13}
+# Replace the DD fathers rows in cohortFraction with the non-SCN1A equivalent.
+nonscn_rows <- comp_scn1a |>
+  filter(str_detect(as.character(source_label), "Non-SCN1A")) |>
+  mutate(source_label = paste0("DD fathers\n(n=", n_samples, ")")) |>
+  select(source_label, vafType, vafProp, count, n_samples)
+
+cohortFraction_110 <- cohortFraction |>
+  filter(!str_detect(as.character(source_label), "DD fathers")) |>
+  select(source_label, vafType, vafProp, count, n_samples) |>
+  bind_rows(nonscn_rows) |>
+  mutate(source_label = fct_relevel(as.character(source_label),
+                                    "Apert fathers\n(n=8)",
+                                    "Controls\n(n=36)",
+                                    "DD fathers\n(n=110)"))
+
+p_cohortFraction_110 <- p_cohortFraction %+% cohortFraction_110
+
+layoutFig4 <- "
+AAA
+BCC
+BDG
+BEG
+BFF
+"
+
+
+figure4_110 <-
+  (legend_plot +
+     p_graphic4a + labs(tag = "A") +
+     plot_spacer() +
+     plot_area_nomosaic + labs(tag = "B") +
+     plot_area_mosaic5 + labs(tag = "C") +
+     plot_spacer() +
+     p_cohortFraction_110 + labs(tag = "D")) +
+  plot_layout(
+    design  = layoutFig4,
+    heights = c(0.2, 0, 2, 2, 0.1),
+    widths  = c(8, 2, 3.5)
+  ) &
+  theme(plot.tag = element_text(size = 14, face = "bold"))
+
+figure4_110
+
+pdf(paste0(outputPath, "Fig4_diseaseRisk_nonSCN1A.pdf"),
+    height = 5, width = 13, onefile = FALSE)
+figure4_110
+dev.off()
+```
+

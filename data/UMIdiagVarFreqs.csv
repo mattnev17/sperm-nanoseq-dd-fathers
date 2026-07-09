@@ -1,0 +1,17 @@
+﻿Tissue,VAF without UMI,VAF with UMI collapsing,MAP from Bayesian model,amplicon spike-in,Var
+semen father,1.00%,1.50%,1.00%,1.20%,IND_027 | VAR_027 | NFIX
+blood mother,8.30%,7.30%,6.80%,NA,IND_038 | VAR_038 | KCND3
+buccal mother,7.60%,7.20%,6.80%,NA,IND_038 | VAR_038 | KCND3
+nail mother,23.00%,22.70%,22.50%,NA,IND_038 | VAR_038 | KCND3
+blood father,6.40%,4.70%,4.10%,NA,IND_046 | VAR_155 | PRPF38A
+buccal father,2.50%,2.40%,2.00%,NA,IND_046 | VAR_155 | PRPF38A
+nail father,1.50%,1.10%,0.70%,NA,IND_046 | VAR_155 | PRPF38A
+semen father,5.50%,5.60%,5.20%,NA,IND_046 | VAR_155 | PRPF38A
+blood father,5.00%,6.50%,6.10%,6.30%,IND_051 | VAR_051 | TUBB2A
+buccal father,8.80%,10.80%,10.70%,10.40%,IND_051 | VAR_051 | TUBB2A
+nail father,15.00%,15.20%,15.10%,NA,IND_051 | VAR_051 | TUBB2A
+semen father,1.50%,2.20%,1.50%,1.50%,IND_051 | VAR_051 | TUBB2A
+semen father,13.80%,12.80%,12.50%,15.90%,IND_097 | VAR_098 | MED13L
+blood mother,21.80%,20.80%,20.20%,NA,IND_122 | VAR_176 | NBPF10
+buccal mother,22.10%,20.20%,20.30%,NA,IND_122 | VAR_176 | NBPF10
+nail mother,19.70%,17.10%,16.60%,NA,IND_122 | VAR_176 | NBPF10

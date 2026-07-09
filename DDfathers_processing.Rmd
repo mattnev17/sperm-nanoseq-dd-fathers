@@ -1,0 +1,3791 @@
+---
+title: "germanTrio_metadata"
+author: "Matt Neville"
+date: "17/01/2022"
+output: html_document
+---
+
+# 1. Prep
+## a) Paths/Libraries
+```{r parameters}
+#Input files on the farm
+path <- "<hpc_scratch>/"
+#Local output
+localPath <- "<local_working_dir>/germanTrio/output/"
+#Meta data/sample lists
+metaPath <- "<local_working_dir>/germanTrio/meta/"
+#Manuscript files
+manuscriptPath <- "<local_working_dir>/germanTrio/Manuscript/"
+#dnds folder
+dndsPath <- "<hpc_scratch>/sperm/germanTrio_data/postNextflow/dNdS_basePairCov/"
+# TwinsUK data
+TUKpath <-  "<local_working_dir>/twinsUK_SpermPaperFiles/"
+
+library(egg)
+library(dndscv)
+library(scales)
+library(readxl)
+library(openxlsx)
+library(ggrepel)
+library(patchwork)
+library(stringi)
+library(ggforce)
+library(ggpubr)
+library(ggpattern)
+library(corrplot)
+library(lme4)
+library(bootpredictlme4)
+suppressPackageStartupMessages(library(tidyverse))
+
+# Shortcut load metadata
+germanTrioSperm <- read_tsv(paste0(metaPath, "germanTrioSperm.tsv"), col_types = cols())
+
+```
+
+## b) Metadata processing
+
+### Sperm samples
+```{r germanTrioMeta}
+germanTrioSpermLong <- 
+  read_xlsx(paste0(metaPath,"Tables/targNanoSeqSpermCanApps.xlsx"), sheet = 1) |> select(Sample_PD_ID = Sample) |> 
+  left_join(germanTrioMeta |> filter(tissue == "SPERM") |> 
+    mutate(Sample_PD_ID = paste0(PD_ID, "_tds0001")), by = join_by(Sample_PD_ID)) |> 
+  mutate(sampleFilter = "FULL") |> 
+  distinct()
+write_tsv(germanTrioSpermLong, paste0(metaPath, "germanTrioSpermLong.tsv"))
+
+OxSpermMetaBasic <- read_tsv(paste0(metaPath, "OxSpermMetaBasic.tsv"), col_types = cols()) |> 
+  arrange(Age) |> 
+  select(-tissue, -ApertMut, -SupplierID, -ssID) |> 
+  mutate(
+    sampleFilter = "FULL",
+    FAM_ID = paste0("FAM_A", row_number()),
+    Cohort = "Apert fathers"
+  )
+
+germanTrioSperm <- germanTrioSpermLong |> 
+  mutate(Cohort = "DD fathers") |> 
+  select(PD_ID, Age, FAM_ID, Cohort, Sample_PD_ID, sampleFilter) |> 
+  distinct() |> 
+  # Remove double samples where one got replaced
+  filter(!PD_ID %in% c("PD63866c", "PD63911d", "PD63789c")) |> 
+  bind_rows(OxSpermMetaBasic) |> filter(sampleFilter == "FULL")
+
+write_tsv(germanTrioSperm, paste0(metaPath, "germanTrioSperm.tsv"))
+write_tsv(germanTrioSperm |> select(Sample_PD_ID, Cohort), paste0(path, "sperm/germanTrio_data/postNextflow/samplesgermanTrio.txt"), col_names = F)
+write_tsv(germanTrioSperm |> select(Sample_PD_ID, Cohort) |> mutate(Cohort = str_replace(Cohort, " ", ".")), paste0(path, "sperm/germanTrio_data/samplesCovList.txt"), col_names = F)
+
+```
+
+### Diagnostic vars
+```{r annotateDiagVars}
+# Vars for Oxford fathers
+diagnosticVarsOx <- read_tsv(paste0(metaPath, "OxSpermMetaBasic.tsv"), col_types = cols()) |> 
+  mutate(
+    Cohort = "Apert fathers",
+    FAM_ID = paste0("FAM_A", row_number()),
+    VAR_ID = if_else(ApertMut == "S252W", "VAR_A52", "VAR_A53"),
+    chr = "10",
+    start = if_else(ApertMut == "S252W", 123279677, 123279674),
+    ref = if_else(ApertMut == "S252W", "G", "G"),
+    alt = if_else(ApertMut == "S252W", "C", "C"),
+    gene = "FGFR2",
+    phasing = "unknown"
+  ) |> 
+  select(chr:phasing, VAR_ID, FAM_ID, Cohort) 
+
+# Vars for german fathers from phasing table. Also add missing var from above
+diagnosticVarsPos <- read_xlsx(paste0(metaPath, "Tables/phasing_information_2025-05-15.xlsx"), range = "A1:Q186") |> 
+  bind_rows(read_xlsx(paste0(metaPath, "Tables/disease-variants_cohort2.xlsx")) |> mutate(START = as.numeric(START))) |> 
+  # Add WGS calling info
+  left_join(read_xlsx(paste0(metaPath, "Tables/phasing_information_Jan2026-RS.xlsx")), by = join_by(VAR_ID, IND_ID)) |> 
+  # Remove non causal vars
+  mutate(numericVar = as.numeric(str_sub(VAR_ID, 5,7))) |> filter(numericVar < 144 | numericVar > 184) |> 
+  mutate(FAM_ID = str_replace(IND_ID, "IND", "FAM")) |> 
+  # Harmonize phasing info
+  mutate(phasing = if_else(status %in% c("maternal", "paternal"), status, "unknown")) |> 
+  mutate(phasing = if_else(phasing == "unknown" & !is.na(Inheritance_Sanger), tolower(Inheritance_Sanger), phasing)) |> 
+  mutate(phasing = if_else(FAM_ID %in% c("FAM_205", "FAM_179", "FAM_177"), "paternal", phasing)) |> 
+  mutate(Cohort = "DD fathers") |> 
+  select(VAR_ID, FAM_ID, Cohort, chr = CHROM, start = START, ref= REF, alt = ALT, gene = GENE,  
+         called_TrioWGS = Called, missing_TrioWGS = `Missing Reason`, phasing) |> 
+  # Ammend Missing/incomplete mutations
+  mutate(start = if_else(FAM_ID == "FAM_205", 166896020, start),
+         ref = if_else(FAM_ID == "FAM_205", "G", ref),
+         alt = if_else(FAM_ID == "FAM_205", "GATATTCC", alt)) |> 
+  mutate(chr = if_else(VAR_ID == "VAR_186", "1", chr),
+         start = if_else(VAR_ID == "VAR_186", 1724694, start),
+         ref = if_else(VAR_ID == "VAR_186", "C", ref),
+         alt = if_else(VAR_ID == "VAR_186", "T", alt)) |> 
+  mutate(chr = if_else(VAR_ID == "VAR_189", "X", chr),
+         start = if_else(VAR_ID == "VAR_189", 133549118, start),
+         ref = if_else(VAR_ID == "VAR_189", "G", ref),
+         alt = if_else(VAR_ID == "VAR_189", "C", alt)) |> 
+  mutate(chr = if_else(VAR_ID == "VAR_194", "8", chr),
+         start = if_else(VAR_ID == "VAR_194", 61765556, start),
+         ref = if_else(VAR_ID == "VAR_194", "G", ref),
+         alt = if_else(VAR_ID == "VAR_194", "A", alt)) |> 
+  mutate(chr = if_else(VAR_ID == "VAR_201", "X", chr),
+         start = if_else(VAR_ID == "VAR_201", 53265644, start),
+         ref = if_else(VAR_ID == "VAR_201", "GGCCGCATCATACCTTTCTGCTTCTCCA", ref),
+         alt = if_else(VAR_ID == "VAR_201", "G", alt)) |> 
+  mutate(chr = if_else(VAR_ID == "VAR_215", "9", chr),
+         start = if_else(VAR_ID == "VAR_215", 135776225, start),
+         ref = if_else(VAR_ID == "VAR_215", "C", ref),
+         alt = if_else(VAR_ID == "VAR_215", "G", alt)) |> 
+  # Ammened indels with slightly different coordinates
+  mutate(chr = if_else(VAR_ID == "VAR_058", "2", chr),
+       start = if_else(VAR_ID == "VAR_058", 230661314, start),
+       ref = if_else(VAR_ID == "VAR_058", "GA", ref),
+       alt = if_else(VAR_ID == "VAR_058", "G", alt),
+       called_TrioWGS = if_else(VAR_ID == "VAR_058", "Yes", called_TrioWGS),
+       missing_TrioWGS = if_else(VAR_ID == "VAR_058", NA, missing_TrioWGS)) |> 
+  mutate(chr = if_else(VAR_ID == "VAR_193", "5", chr),
+     start = if_else(VAR_ID == "VAR_193", 176696808, start),
+     ref = if_else(VAR_ID == "VAR_193", "G", ref),
+     alt = if_else(VAR_ID == "VAR_193", "A", alt),
+     missing_TrioWGS = if_else(VAR_ID == "VAR_193", NA, missing_TrioWGS)) |> 
+  mutate(chr = if_else(VAR_ID == "VAR_224", "9", chr),
+     start = if_else(VAR_ID == "VAR_224", 135782135, start),
+     ref = if_else(VAR_ID == "VAR_224", "T", ref),
+     alt = if_else(VAR_ID == "VAR_224", "TC", alt)) |> 
+  mutate(chr = if_else(VAR_ID == "VAR_232", "17", chr),
+     start = if_else(VAR_ID == "VAR_232", 29560047, start),
+     ref = if_else(VAR_ID == "VAR_232", "CAA", ref),
+     alt = if_else(VAR_ID == "VAR_232", "C", alt)) |> 
+  mutate(chr = if_else(VAR_ID == "VAR_004", "9", chr),
+     start = if_else(VAR_ID == "VAR_004", 130416029, start),
+     ref = if_else(VAR_ID == "VAR_004", "GTCC", ref),
+     alt = if_else(VAR_ID == "VAR_004", "G", alt)) |> 
+  mutate(chr = if_else(VAR_ID == "VAR_008", "8", chr),
+     start = if_else(VAR_ID == "VAR_008", 61769134, start),
+     ref = if_else(VAR_ID == "VAR_008", "TG", ref),
+     alt = if_else(VAR_ID == "VAR_008", "T", alt)) |> 
+  mutate(chr = if_else(VAR_ID == "VAR_124", "3", chr),
+     start = if_else(VAR_ID == "VAR_124", 41275128, start),
+     ref = if_else(VAR_ID == "VAR_124", "TATA", ref),
+     alt = if_else(VAR_ID == "VAR_124", "T", alt)) |> 
+  mutate(chr = if_else(VAR_ID == "VAR_132", "X", chr),
+     start = if_else(VAR_ID == "VAR_132", 73960933, start),
+     ref = if_else(VAR_ID == "VAR_132", "G", ref),
+     alt = if_else(VAR_ID == "VAR_132", "GT", alt)) |> 
+  mutate(chr = if_else(VAR_ID == "VAR_198", "21", chr),
+     start = if_else(VAR_ID == "VAR_198", 34927287, start),
+     ref = if_else(VAR_ID == "VAR_198", "CAGTT", ref),
+     alt = if_else(VAR_ID == "VAR_198", "C", alt)) |> 
+  mutate(chr = if_else(VAR_ID == "VAR_217", "X", chr),
+     start = if_else(VAR_ID == "VAR_217", 153296811, start),
+     ref = if_else(VAR_ID == "VAR_217", "G", ref),
+     alt = if_else(VAR_ID == "VAR_217", "C", alt)) |> 
+  mutate(chr = if_else(VAR_ID == "VAR_228", "2", chr),
+     start = if_else(VAR_ID == "VAR_228", 166893043, start),
+     ref = if_else(VAR_ID == "VAR_228", "TAAAAACAAC", ref),
+     alt = if_else(VAR_ID == "VAR_228", "T", alt)) |> 
+  mutate(alt = if_else(VAR_ID == "VAR_115", "AC", alt)) |> 
+  mutate(alt = if_else(VAR_ID == "VAR_139", "GA", alt)) |> 
+  mutate(ref = if_else(VAR_ID == "VAR_197", "TC", ref)) |> 
+  mutate(ref = if_else(VAR_ID == "VAR_206", "C", ref),
+         alt = if_else(VAR_ID == "VAR_206", "T", alt)) |> 
+  mutate(ref = if_else(VAR_ID == "VAR_220", "TG", ref),
+         alt = if_else(VAR_ID == "VAR_220", "T", alt)) |> 
+  mutate(ref = if_else(VAR_ID == "VAR_229", "TG", ref),
+         alt = if_else(VAR_ID == "VAR_229", "T", alt)) |> 
+  mutate(ref = if_else(VAR_ID == "VAR_230", "T", ref),
+         alt = if_else(VAR_ID == "VAR_230", "G", alt)) |> 
+  mutate(called_TrioWGS = if_else(VAR_ID == "VAR_223", NA, called_TrioWGS),
+       missing_TrioWGS = if_else(VAR_ID == "VAR_223", NA, missing_TrioWGS)) |> 
+  # Annotating large deletions
+  mutate(chr = if_else(VAR_ID == "VAR_210", "11", chr),
+         start = if_else(VAR_ID == "VAR_210", NA, start),
+         ref = if_else(VAR_ID == "VAR_210", "LargeDeletion", ref),
+         alt = if_else(VAR_ID == "VAR_210", "LargeDeletion", alt)) |> 
+  mutate(ref = if_else(VAR_ID == "VAR_086", "LargeDeletion", ref),
+       alt = if_else(VAR_ID == "VAR_086", "LargeDeletion", alt)) |> 
+  mutate(ref = if_else(VAR_ID == "VAR_012", "LargeDeletion", ref),
+     alt = if_else(VAR_ID == "VAR_012", "LargeDeletion", alt),
+     missing_TrioWGS = if_else(VAR_ID == "VAR_012", "Too Large variant", missing_TrioWGS)) |> 
+  # Low vaf
+  mutate(start = if_else(VAR_ID == "VAR_191", 26156978, start),
+    called_TrioWGS = if_else(VAR_ID == "VAR_191", "No", called_TrioWGS),
+    missing_TrioWGS = if_else(VAR_ID == "VAR_191", "VAF <0.3 (0.20)", missing_TrioWGS)) |> 
+  mutate(start = if_else(VAR_ID == "VAR_192", 135778036, start),
+    called_TrioWGS = if_else(VAR_ID == "VAR_192", "No", called_TrioWGS),
+    missing_TrioWGS = if_else(VAR_ID == "VAR_192", "VAF <0.3 (0.21)", missing_TrioWGS)) |> 
+  mutate(start = if_else(VAR_ID == "VAR_200", 52159789, start),
+    called_TrioWGS = if_else(VAR_ID == "VAR_200", "No", called_TrioWGS),
+    missing_TrioWGS = if_else(VAR_ID == "VAR_200", "VAF <0.3 (0.25)", missing_TrioWGS)) |> 
+  mutate(start = if_else(VAR_ID == "VAR_022", 71064729, start),
+    called_TrioWGS = if_else(VAR_ID == "VAR_022", "No", called_TrioWGS),
+    missing_TrioWGS = if_else(VAR_ID == "VAR_022", "VAF <0.3 (0.25)", missing_TrioWGS)) |> 
+  # Encode missing more clearly
+  mutate(missing_TrioWGS = str_replace(missing_TrioWGS, "FF010", "In unmatched normal panel")) |> 
+  mutate(missing_TrioWGS = str_replace(missing_TrioWGS, "VUM", "In unmatched normal panel")) |> 
+  mutate(missing_TrioWGS = str_replace(missing_TrioWGS, "FF016", "Failed Pindel indel validation")) |> 
+  mutate(missing_TrioWGS = str_replace(missing_TrioWGS, "parental VAF > 0", "Paternal VAF > 0")) |> 
+  mutate(missing_TrioWGS = str_replace(missing_TrioWGS, "ASRD < 0.87 \\(0.85\\)", "Low variant-read alignment score")) |>
+  mutate(missing_TrioWGS = str_replace(missing_TrioWGS, "7:101882729;p.L1262Q", "No Pindel call but visible in manual inspection")) |>
+  mutate(missing_TrioWGS = str_replace(missing_TrioWGS, "Too Large variant", "Too large but visible in manual inspection")) |>
+  # Add oxford apert cases
+  bind_rows(diagnosticVarsOx) 
+
+write_tsv(diagnosticVarsPos, paste0(metaPath, "diagnosticVarsPos.txt"))
+```
+
+# 2. Post Canapps processing
+### Pull samples Nexflow batch output
+```{bash ContamSummaries, eval=FALSE}
+
+bsub -J "canAppsCopy_3606" \
+  -o <hpc_scratch>/sperm/exomes/canAppsOutput/canAppsCopy_3606.%J.out \
+  -e <hpc_scratch>/sperm/exomes/canAppsOutput/canAppsCopy_3606.%J.err \
+  -q normal \
+  -R 'select[mem>=200] rusage[mem=200] span[hosts=1]' -M 200 \
+  "bash -lc '
+# Set destination directory
+dest_base=\"<hpc_scratch>/sperm/exomes/canAppsOutput\"
+
+# Set source directory depends where pulling
+#src_base=\"<hpc_references>/nst_links/live/3472\"
+#src_base=\"<hpc_references>/nst_links/live/3707\"
+# Loop over each PD* directory in the source
+for pd_dir in \"\$src_base\"/PD*/; do
+  pd_id=\$(basename \"\$pd_dir\")
+  dest_dir=\"\$dest_base/\$pd_id\"
+
+  # Create corresponding PD folder in destination
+  mkdir -p \"\$dest_dir\"
+
+  # Copy only specific files
+  cp \"\$pd_dir\"/*.sample.effi.tsv \"\$dest_dir\" 2>/dev/null
+  cp \"\$pd_dir\"/*.summary.tar.gz \"\$dest_dir\" 2>/dev/null
+  cp \"\$pd_dir\"/*.tnanoseq.discardedvariants.vcf.gz \"\$dest_dir\" 2>/dev/null
+
+  # Unzip summary tarballs inside each PD folder
+  for tarfile in \"\$dest_dir\"/*.summary.tar.gz; do
+    [ -e \"\$tarfile\" ] || continue
+    tar -xvzf \"\$tarfile\" -C \"\$dest_dir\"
+  done
+done
+'"
+
+```
+
+### Efficiency
+```{bash ContamSummaries, eval=FALSE}
+cd <hpc_scratch>/sperm/germanTrio_data/canAppsOutput
+rm effi.txt
+
+commonPath="<hpc_scratch>/sperm/germanTrio_data/canAppsOutput"
+
+for sample in $(cut -f1 ../samplesgermanTrio.txt); do
+  echo $sample
+  
+  # Shows contaminant level.
+  seqReads=$(head -n 2 "$commonPath/$sample/$sample.sample.effi.tsv" | tail -n 1 | awk '{print $2}')
+  dupRate=$(head -n 6 "$commonPath/$sample/$sample.sample.effi.tsv" | tail -n 1 | awk '{print $2}')
+  f_eff=$(head -n 12 "$commonPath/$sample/$sample.sample.effi.tsv" | tail -n 1 | awk '{print $2}')
+  
+  echo -e "${sample}\t${seqReads}\t${dupRate}\t${f_eff}" >> effi.txt
+done
+
+
+```
+
+### Burdens
+```{bash burdens, eval=FALSE}
+cd <hpc_scratch>/sperm/germanTrio_data/canAppsOutput/
+rm burdens.tsv
+for sample in `cut -f1 ../samplesgermanTrio.txt | grep "PD6"`;
+  do echo $sample
+  sed '/muts/d' <hpc_references>/nst_links/live/3472/$sample/$sample.tnanoseq.mut_burden.tsv | sed "s/$/\t$sample/" >> burdens.tsv
+done
+for sample in `cut -f1 ../samplesgermanTrio.txt | grep "PD5"`;
+  do echo $sample
+  sed '/muts/d' <hpc_references>/nst_links/live/3707/$sample/$sample.tnanoseq.mut_burden.tsv | sed "s/$/\t$sample/" >> burdens.tsv
+done
+```
+
+### Variant Calls
+```{bash varCalls, eval=FALSE}
+#Merge together all calls
+cd <hpc_scratch>/sperm/germanTrio_data/canAppsOutput/
+rm mergedCalls.vcf
+for sample in `cut -f1 ../samplesgermanTrio.txt | grep "PD6"`;
+ do echo $sample
+  gunzip -c <hpc_references>/nst_links/live/3472/$sample/$sample.tnanoseq.vcf.gz | sed '/#/d' | sed "s/$/\t$sample/" >> mergedCalls.vcf
+done
+for sample in `cut -f1 ../samplesgermanTrio.txt | grep "PD5"`;
+ do echo $sample
+  gunzip -c <hpc_references>/nst_links/live/3707/$sample/$sample.tnanoseq.vcf.gz | sed '/#/d' | sed "s/$/\t$sample/" >> mergedCalls.vcf
+done
+
+### Discarded Calls
+cd <hpc_scratch>/sperm/germanTrio_data/canAppsOutput/
+rm discardedCalls.vcf
+for sample in `cut -f1 ../samplesgermanTrio.txt | grep "PD6"`;
+ do echo $sample
+  gunzip -c <hpc_references>/nst_links/live/3472/$sample/$sample.tnanoseq.discardedvariants.vcf.gz | sed '/#/d' | sed "s/$/\t$sample/" >> discardedCalls.vcf
+done
+for sample in `cut -f1 ../samplesgermanTrio.txt | grep "PD5"`;
+ do echo $sample
+  gunzip -c <hpc_references>/nst_links/live/3707/$sample/$sample.tnanoseq.discardedvariants.vcf.gz | sed '/#/d' | sed "s/$/\t$sample/" >> discardedCalls.vcf
+done
+```
+
+### Coverage script
+Save as runCov.sh
+```{bash cov, eval=FALSE}
+#!/usr/bin/env bash
+# runCov.sh
+# Usage:
+#   bash runCov.sh <GROUP_NAME> <LIVE_FOLDER> <PANEL_FILE>
+# Example:
+#   bash runCov.sh targeted1 3769 panelV1_37_noChr.500pad.merged.bed
+
+set -euo pipefail
+
+if [ "$#" -ne 3 ]; then
+  echo "Usage: bash runCov.sh <GROUP_NAME> <LIVE_FOLDER> <PANEL_FILE>"
+  exit 1
+fi
+
+GROUP="$1"
+LIVE_FOLDER="$2"
+PANEL_FILE="$3"
+
+BASE_DIR="<hpc_scratch>/sperm/germanTrio_data/postNextflow/"
+cd "$BASE_DIR"
+
+COV_SRC_BASE="<hpc_references>/nst_links/live/${LIVE_FOLDER}"
+PANEL="<hpc_scratch>/genomicRegions/${PANEL_FILE}"
+
+mkdir -p cov/{jobLogs,tmp,targCut,inPanel,sampleStats,final}
+
+SAMPLE_LIST="cov/${GROUP}_samples.txt"
+OUT_STATS="cov/final/${GROUP}.statsCoverage.tsv"
+OUT_BED="cov/final/${GROUP}.totalCov.bed"
+OUT_GZ="cov/final/${GROUP}.totalCov.bed.gz"
+
+# Build sample list from tukTargSperm.tsv (col1=sample, col2=group)
+awk -F'\t' -v g="$GROUP" '$2==g{print $1}' samplesCovList.txt > "$SAMPLE_LIST"
+
+N_SAMPLES="$(wc -l < "$SAMPLE_LIST" | tr -d ' ')"
+
+echo "Group: $GROUP"
+echo "Live folder: $LIVE_FOLDER"
+echo "Panel: $PANEL_FILE"
+echo "Sample count: $N_SAMPLES"
+
+if [ "$N_SAMPLES" -eq 0 ]; then
+  echo "ERROR: No samples found for group '$GROUP'"
+  exit 1
+fi
+
+rm -f "$OUT_STATS" "$OUT_BED" "$OUT_GZ" "${OUT_GZ}.tbi" 2>/dev/null || true
+
+submitted=()
+
+# -------------------------
+# Stage 1: per-sample jobs
+# -------------------------
+while read -r sample; do
+  out_tsv="cov/sampleStats/${sample}.tsv"
+  targ="cov/targCut/${sample}.cov.bed"
+  panel_bed="cov/inPanel/${sample}.inPanelCov.bed"
+
+  if [ -s "$out_tsv" ]; then
+    echo "Skipping (already done): $sample"
+    continue
+  fi
+
+  echo "Submitting: $sample"
+
+  bsub -J "${GROUP}_cov_${sample}" \
+       -o "cov/jobLogs/${GROUP}_cov.${sample}.out" \
+       -e "cov/jobLogs/${GROUP}_cov.${sample}.err" \
+       -q normal \
+       -R 'select[mem>=100] rusage[mem=100] span[hosts=1]' -M 100 \
+    "set -euo pipefail
+     module load bedtools2-2.29.0/ || true
+
+     in_gz='${COV_SRC_BASE}/${sample}/${sample}.tnanoseq.cov.bed.gz'
+     targ='${targ}'
+     panel_bed='${panel_bed}'
+     out_tsv='${out_tsv}'
+     tmpdir='cov/tmp'
+
+     gunzip -c \"\$in_gz\" \
+       | awk -F'[;\\t]' '\$6 > 10' \
+       | sed 's/;/\\t/g' \
+       | cut -f1-3,6 \
+       | sort -T \"\$tmpdir\" -k1,1 -k2,2n \
+       > \"\$targ\"
+
+     bedtools intersect -a \"\$targ\" -b '${PANEL}' > \"\$panel_bed\"
+
+     bpUnique=\$(wc -l < \"\$targ\")
+     bpTotal=\$(awk -F '\\t' '{s+=\$4} END {print s+0}' \"\$targ\")
+     bpMedian=\$(datamash -s median 4 < \"\$targ\")
+
+     bpUniquePanel=\$(wc -l < \"\$panel_bed\")
+     bpTotalPanel=\$(awk -F '\\t' '{s+=\$4} END {print s+0}' \"\$panel_bed\")
+     bpMedianPanel=\$(datamash -s median 4 < \"\$panel_bed\")
+
+     printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \
+       '${sample}' \"\$bpUnique\" \"\$bpTotal\" \"\$bpMedian\" \
+       \"\$bpUniquePanel\" \"\$bpTotalPanel\" \"\$bpMedianPanel\" \
+       > \"\$out_tsv\"
+    "
+
+  submitted+=("$sample")
+done < "$SAMPLE_LIST"
+
+deps=""
+if [ "${#submitted[@]}" -gt 0 ]; then
+  for s in "${submitted[@]}"; do
+    deps="${deps} && done(${GROUP}_cov_${s})"
+  done
+  deps="${deps# && }"
+fi
+
+# -------------------------
+# Stage 2: finalize job (always runs)
+# -------------------------
+bsub -J "${GROUP}_finalize" \
+     -o "cov/jobLogs/${GROUP}_finalize.%J.out" \
+     -e "cov/jobLogs/${GROUP}_finalize.%J.err" \
+     -q normal \
+     -R 'select[mem>=200] rusage[mem=200] span[hosts=1]' -M 200 \
+     ${deps:+-w "$deps"} \
+  "set -euo pipefail
+   module load bedtools2-2.29.0/ || true
+   module load htslib/ || true
+
+   : > \"${OUT_STATS}\"
+   files=\"\"
+
+   while read -r sample; do
+     cat cov/sampleStats/\${sample}.tsv >> \"${OUT_STATS}\"
+     files=\"\$files cov/targCut/\${sample}.cov.bed\"
+   done < \"${SAMPLE_LIST}\"
+
+   bedtools unionbedg -i \$files \
+     | awk 'BEGIN{OFS=\"\t\"}{s=0; for(i=4;i<=NF;i++) s+=\$i; print \$1,\$2,\$3,s}' \
+     > \"${OUT_BED}\"
+
+   bgzip -f -c \"${OUT_BED}\" > \"${OUT_GZ}\"
+   tabix -f -p bed \"${OUT_GZ}\"
+  "
+
+echo
+echo "Submitted pipeline for $GROUP"
+echo "Final outputs:"
+echo "  $OUT_STATS"
+echo "  $OUT_GZ"
+```
+
+### Run Cov
+```{bash covRun, eval=FALSE}
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/cov/
+bash runCov.sh DD.fathers 3472 germlineV2_hg19.bed
+bash runCov.sh Apert.fathers 3707 germlineV1_hg19.bed
+```
+
+### TriNuc Background
+```{bash triNucBackground, eval=FALSE}
+#Merge together trinucs
+cd <hpc_scratch>/sperm/germanTrio_data/canAppsOutput/
+rm trinuc.txt
+for sample in `cut -f1 ../samplesgermanTrio.txt`;
+ do echo $sample
+  cut -f1,2 <hpc_scratch>/sperm/germanTrio_data/canAppsOutput/$sample/${sample}_vs_${sample}.summary/${sample}_vs_${sample}.trint_counts_and_ratio2genome.tsv | sed '/ratio/d' | sed "s/$/\t$sample/" >> trinuc.txt
+done
+
+```
+
+### Neat crams
+```{bash cov, eval=FALSE}
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/neatCrams
+
+for sample in `cut -f1 ../../samplesgermanTrio.txt | grep "PD6"`;
+  do echo $sample
+  ln -s <hpc_references>/nst_links/live/3472/$sample/$sample.sample.neat.cram .
+  ln -s <hpc_references>/nst_links/live/3472/$sample/$sample.sample.neat.cram.crai .
+done
+for sample in `cut -f1 ../../samplesgermanTrio.txt | grep "PD5"`;
+  do echo $sample
+  ln -s <hpc_references>/nst_links/live/3707/$sample/$sample.sample.neat.cram .
+  ln -s <hpc_references>/nst_links/live/3707/$sample/$sample.sample.neat.cram.crai .
+done
+```
+
+# 3. QC
+## a) Check burdens/Masked SNP counts
+```{r maskedCounts}
+
+#First snvs/mnvs then bind indels as they have different column orders
+allCallsTarg <- read_tsv(paste0(path, "sperm/germanTrio_data/canAppsOutput/mergedCalls.vcf"), col_names = c("chr", "start", "ref", "alt", "FILTER","info", "Sample_PD_ID"), col_types = 'cd-cc-ccc') |>
+  filter(str_detect(info, "nv")) |>
+  separate(info, sep = ";", into = c("TRI","TIMES_CALLED","TYPE","DUPLEX_VAF","BAM_VAF","BAM_VAF_BQ10",NA,NA,NA,NA,"DUPLEX_COV","BAM_MUT","BAM_COV","BAM_MUT_BQ10","BAM_COV_BQ10",NA,"QPOS",NA,NA,NA,NA,NA), convert = T) |> 
+  mutate_at(vars(TRI:QPOS), ~str_remove(., ".*=")) |> 
+  mutate_at(vars(TIMES_CALLED, DUPLEX_VAF:BAM_COV_BQ10), as.numeric) |>
+  # Add indels
+  bind_rows(read_tsv(paste0(path, "sperm/germanTrio_data/canAppsOutput/mergedCalls.vcf"), col_names = c("chr", "start", "ref", "alt", "FILTER","info", "Sample_PD_ID"), col_types = 'cd-cc-ccc') |> 
+    filter(!str_detect(info, "nv")) |>
+    separate(info, sep = ";", into = c("TYPE","TIMES_CALLED","DUPLEX_VAF","BAM_VAF","BAM_VAF_BQ10",NA,NA,NA,NA,NA,"DUPLEX_COV","BAM_MUT","BAM_COV","BAM_MUT_BQ10","BAM_COV_BQ10", NA, "QPOS"), convert = T) |> 
+    mutate_at(vars(TYPE:QPOS), ~str_remove(., ".*=")) |> 
+    mutate_at(vars(TIMES_CALLED:BAM_COV_BQ10), as.numeric)) |> 
+  left_join(germanTrioSperm, by = "Sample_PD_ID") |> 
+  mutate(QPOS = ifelse(str_detect(QPOS, ","),
+                       sapply(str_split(QPOS, ","), function(x) median(as.numeric(x))),
+                       as.numeric(QPOS))) |> 
+  mutate(FILTER = str_replace(FILTER, "MASKED", "NanoSeqMask")) |> 
+  suppressWarnings()
+write_tsv(allCallsTarg,  paste0(path, "sperm/germanTrio_data/postNextflow/contamFilter/allCallsTarg.tsv"))
+
+#Read in QC metrics
+
+seqMetrics <-  read_tsv(paste0(path, "sperm/germanTrio_data/canAppsOutput/effi.txt"),  col_names = c("Sample_PD_ID", "seqReads", "dupRate", "f_eff"), col_types = 'cddd')
+
+
+#Calculate burdens from variant counts so that DNVs aren't double counted (DNV/MNVs merged post burden calc)
+adjBurdens <- germanTrioSperm |> filter(sampleFilter != "dnaBelow0.05") |> select(Sample_PD_ID) |> 
+  # Add muts
+  left_join(allCallsTarg |> filter(FILTER == "PASS") |> filter(TYPE %in% c("snv", "dnv", "mnv")) |> 
+  group_by(Sample_PD_ID) |> dplyr::summarize(muts = sum(TIMES_CALLED)), by = "Sample_PD_ID") |>  
+  # Add indel burdens
+  left_join(allCallsTarg |> filter(FILTER == "PASS") |> filter(TYPE %in% c("del", "ins")) |> 
+    group_by(Sample_PD_ID) |> dplyr::summarize(indels = sum(TIMES_CALLED)), by = "Sample_PD_ID") |> 
+  mutate(muts = replace_na(muts, 0)) |> mutate(indels = replace_na(indels, 0)) 
+
+#Compare and merge with burdens in pipeline
+burdens <- read_tsv(paste0(path, "sperm/germanTrio_data/canAppsOutput/burdens.tsv"), col_names = c("group", "muts",	"total",	"burden",	"burden_lci",	"burden_uci", "Sample_PD_ID"), col_types = 'cdddddc') |> 
+  filter(group == "observed") |> select(-c(muts, burden)) |> 
+  left_join(adjBurdens, by = "Sample_PD_ID") |> 
+  mutate(burden = muts/total) |> 
+  mutate(indelBurden = indels/total) |> 
+  select(Sample_PD_ID, muts, indels, total, burden, indelBurden) 
+
+#Find counts of masked and passed variants
+maskedCounts <- allCallsTarg |> 
+  mutate(FILTER = if_else(FILTER == "PASS", FILTER, "MASKED")) |> 
+  mutate(TYPE = if_else(TYPE %in% c("snv", "dnv", "mnv"), "snv", "indel")) |> 
+  group_by(Sample_PD_ID, FILTER, TYPE) |> summarize(count = n(), .groups = "drop") |> 
+  pivot_wider(id_cols = Sample_PD_ID, names_from = c(FILTER,TYPE), names_sep = "_", values_from = count, values_fill = 0) |> 
+  left_join(germanTrioSperm, by = "Sample_PD_ID") |> 
+  left_join(burdens, by = "Sample_PD_ID") |> 
+  left_join(seqMetrics, by = "Sample_PD_ID") |> 
+  mutate(maskedProportion = MASKED_snv/PASS_snv) |> 
+  mutate(maskedProportionIndel = MASKED_indel/PASS_indel) |> 
+  mutate(above5 = if_else(maskedProportion > 5, T,F)) |> 
+  mutate(label = if_else((maskedProportion > 5 | burden > 1e-7), str_remove(FAM_ID, "FAM_"), "")) |> 
+  mutate(concern = if_else((maskedProportion > 5 | burden > 1e-7), T, F))
+
+```
+
+
+## b) Filter variants
+### Implement filters
+```{r varContam, fig.width= 12, fig.height=12}
+
+# List of noisy sites in discarded calls file to exclude in call set
+# anyCounts <- read_tsv(paste0(path, "sperm/germanTrio_data/canAppsOutput/discardedCalls.vcf"), col_names = c("chr", "start", "ref", "alt", "FILTER","info", "Sample_PD_ID"), col_types = 'cd-cc-ccc') |>
+#   group_by(chr,start) |> summarise(varCount = n(), .groups = "drop") |> 
+  # filter(varCount > 2) |> 
+  # bind_rows(read_tsv(paste0(path, "sperm/germanTrio_data/canAppsOutput/discardedCalls.vcf"), col_names = c("chr", "start", "ref", "alt", "FILTER","info", "Sample_PD_ID"), col_types = 'cd-cc-ccc') |> 
+  # filter(!str_detect(info, ";N=1;")) |>
+  # group_by(chr,start) |> summarise(varCount2 = n(), .groups = "drop")) |> 
+  # distinct(chr,start) |> 
+  # mutate(varCount = 1)
+# write_tsv(anyCounts, paste0(path, "sperm/germanTrio_data/canAppsOutput/discardedCallsSimple.vcf"))
+anyCounts <- read_tsv(paste0(path, "sperm/germanTrio_data/canAppsOutput/discardedCallsSimple.vcf"), col_types = cols())
+
+# Allele freq threshold to use:
+bamThreshold = 0.3
+duplexThreshold = 0.3
+minCoverage = 11
+
+allCallsFilter <- allCallsTarg |> 
+  mutate(class = if_else(TYPE == "snv", "snv", "indel")) |> 
+  # VAF/coverage cutoffs
+  mutate(FILTER = if_else(FILTER == "PASS" & (BAM_VAF >= bamThreshold | DUPLEX_VAF >= duplexThreshold | DUPLEX_COV <= minCoverage), "alleleFreqThreshold", FILTER, missing = "NanoSeqMask")) |> 
+  # Cohort germline vars. Small effect in this cohort so only removing 2 SNP sites common in cohort (seen as germline vars in >2 indivs)
+  left_join(anyCounts, by = c("chr", "start"))  |> mutate(varCount = replace_na(varCount, 0)) |> 
+  mutate(FILTER = if_else(FILTER == "PASS" & (varCount > 0), "cohortMask", FILTER)) |> 
+  # Manually filter recurrent artefacts
+  mutate(FILTER = if_else(start == 34927486 & chr == "21", "manualMask", FILTER)) |> 
+  mutate(FILTER = if_else(start == 13409946 & chr == "19", "manualMask", FILTER)) |> 
+  mutate(FILTER = if_else(start == 1952721 & chr == "4", "manualMask", FILTER)) |> 
+  mutate(FILTER = if_else(start == 102516324 & chr == "14", "manualMask", FILTER)) |> 
+  mutate(FILTER = if_else(start == 86584359 & chr == "9", "manualMask", FILTER)) |> 
+  mutate(FILTER = if_else(start == 72831388 & chr == "16", "manualMask", FILTER)) |> 
+  mutate(FILTER = if_else(start == 48982774 & chr == "2", "manualMask", FILTER)) |> 
+  mutate(FILTER = if_else(start == 72822586 & chr == "16", "manualMask", FILTER)) |> 
+  mutate(FILTER = if_else(start == 133184690 & chr == "8", "manualMask", FILTER)) |> 
+  mutate(FILTER = if_else(start == 148338 & chr == "16", "manualMask", FILTER)) |> 
+  mutate(FILTER = if_else(start == 114724469 & chr == "10", "manualMask", FILTER)) |> 
+  mutate(FILTER = if_else(start == 61734242 & chr == "8", "manualMask", FILTER)) |> 
+  mutate(FILTER = if_else(start == 2039773 & chr == "9", "manualMask", FILTER)) |> 
+  mutate(FILTER = if_else(start == 38946606 & chr == "19", "manualMask", FILTER)) |>
+  mutate(FILTER = if_else(start == 23892380 & chr == "15", "manualMask", FILTER)) |>
+  mutate(FILTER = if_else(start == 232372410 & chr == "2", "manualMask", FILTER)) |>
+  mutate(FILTER = if_else(str_detect(as.character(start), "7299") & chr == "16", "manualMask", FILTER)) |> # Bad ZFHX3 region
+  mutate(FILTER = if_else(start %in% c(120539414,120539315,120539316) & chr == "1", "manualMask", FILTER)) |> 
+  group_by(chr, start) |> 
+  mutate(FILTER = if_else(FILTER == "PASS" & any(FILTER != "PASS"), "manualMask", FILTER)) |> 
+  # Diagnostic vars treat separately
+  mutate(FILTER = if_else(start == 116420191 & chr == "12" & PD_ID == "PD63954c", "diagVar", FILTER)) |> 
+  mutate(FILTER = if_else(start == 13135994 & chr == "19" & PD_ID == "PD63888c", "diagVar", FILTER)) |> 
+  mutate(FILTER = if_else(start == 14280495 & chr == "5" & PD_ID == "PD63917c", "diagVar", FILTER)) |> 
+  mutate(FILTER = if_else(start == 3155143 & chr == "6" & PD_ID == "PD63911c", "diagVar", FILTER)) |> 
+  mutate(FILTER = if_else(start == 148526832 & chr == "7" & PD_ID == "PD68811b", "diagVar", FILTER)) |> 
+  mutate(FILTER = if_else(start == 166896020 & chr == "2" & PD_ID == "PD68831b", "diagVar", FILTER)) |> 
+  mutate(FILTER = if_else(start == 166909427 & chr == "2" & PD_ID == "PD68787b", "diagVar", FILTER)) |> 
+  mutate(FILTER = if_else(start == 9928084 & chr == "16" & PD_ID == "PD68809b", "diagVar", FILTER)) |> 
+  # CA issue in Apert samples
+  mutate(FILTER = if_else(paste0(str_sub(TRI, 2,2), str_sub(TRI, 5,5)) %in% c("CA", "GT") & 
+                        BAM_VAF > 0.002 & str_detect(Sample_PD_ID, "PD5") & FILTER == "PASS", "C>A_enzyme", FILTER)) |> 
+  mutate(FILTER = str_remove(FILTER, ";shearwater")) |> 
+  ungroup() 
+ 
+table(allCallsFilter$FILTER)
+
+# Filter to preset cutoff
+filteredVars <- allCallsFilter |> 
+  filter(FILTER == "PASS") |> 
+  select(chr:alt,TRI, TYPE, TIMES_CALLED, DUPLEX_COV, DUPLEX_VAF, BAM_MUT, BAM_COV, BAM_VAF, Sample_PD_ID:sampleFilter)
+
+write_tsv(filteredVars, paste0(path, "sperm/germanTrio_data/postNextflow/contamFilter/snpFilterVars.tsv"))
+
+repetitiveSites <- filteredVars |> group_by(chr,start, TYPE) |> summarise(count = n(), .groups = "drop", mean = mean(TIMES_CALLED), median = median(TIMES_CALLED)) |> 
+  arrange(-count) |> filter(count > 1) |> 
+  left_join(read_tsv(paste0(localPath, "data/allCallsFilterVarsVEP.tsv"), col_types = cols()) |> 
+              select(chr, start, TYPE, csq:ClinVar) |> distinct(), by = join_by(chr, start, TYPE)) 
+```
+
+#### Bam VAF Plot
+```{r bamVAF, fig.height=7, fig.width=9}
+vaf_colours <- c("NanoSeqMask" = "#fb8072",
+                 "cohortMask" = "#fdb462",
+                 "manualMask" = "cadetblue",
+                 "dbsnp" = "#addd8e",
+                 "shearwater" = "lightpink",
+                 "NEI_IND" = "#91003f",
+                 "alleleFreqThreshold" = "lightyellow",
+                 "C>A_enzyme" = "darkorchid3",
+                 "PASS" = "#80b1d3")
+
+# Calculate the counts for each filter category
+filter_counts_initial <- allCallsTarg |>
+  count(FILTER)
+
+filter_counts_cohort <- allCallsFilter |>
+  count(FILTER)
+
+# Create new labels with counts for the legend
+vaf_labels_initial <- setNames(paste0(filter_counts_initial$FILTER, " (n=", filter_counts_initial$n, ")"), filter_counts_initial$FILTER)
+vaf_labels_cohort <- setNames(paste0(filter_counts_cohort$FILTER, " (n=", filter_counts_cohort$n, ")"), filter_counts_cohort$FILTER)
+
+# Updated plot for initialVAF
+p_initialVAF <- allCallsTarg |> 
+  mutate(TYPE = if_else(TYPE == "snv", "Substitutions", "Indels")) |> 
+  mutate(TYPE = factor(TYPE, levels = c("Substitutions", "Indels"), ordered = TRUE)) |> 
+  mutate(FILTER = if_else(FILTER == "dbsnp;shearwater", "dbsnp", FILTER)) |>
+  mutate(BAM_VAF = if_else(BAM_VAF == 0, BAM_VAF_BQ10, BAM_VAF)) |> 
+  mutate(BAM_VAF = if_else(BAM_VAF == 0, DUPLEX_VAF, BAM_VAF)) |> 
+  mutate(FILTER = factor(FILTER, levels = names(vaf_colours), ordered = TRUE)) |> 
+  ggplot(aes(BAM_VAF, after_stat(count), fill = FILTER)) +
+  scale_fill_manual(values = vaf_colours, labels = vaf_labels_initial) +
+  scale_x_log10(limits = c(6e-5, NA)) +
+  geom_density(position = "stack") +
+  ylab("Density") +
+  guides(fill=guide_legend(title="Pipeline filters")) +
+  facet_wrap(~TYPE, scales = "free_y", ncol = 2) +
+  theme_pubr() +
+  theme(legend.position = "right", strip.background = element_blank(), strip.text = element_text(size = 12))
+
+# Updated plot for cohortMaskVAF
+p_cohortMaskVAF <- allCallsFilter |> filter(FILTER != "diagVar") |> 
+  mutate(TYPE = if_else(TYPE == "snv", "Substitutions", "Indels")) |> 
+  mutate(TYPE = factor(TYPE, levels = c("Substitutions", "Indels"), ordered = TRUE)) |> 
+  mutate(BAM_VAF = if_else(BAM_VAF == 0, BAM_VAF_BQ10, BAM_VAF)) |> 
+  mutate(BAM_VAF = if_else(BAM_VAF == 0, DUPLEX_VAF, BAM_VAF)) |> 
+  mutate(FILTER = factor(FILTER, levels = names(vaf_colours), ordered = TRUE)) |> 
+  ggplot(aes(BAM_VAF, after_stat(count), fill = FILTER)) +
+  scale_fill_manual(values = vaf_colours, labels = vaf_labels_cohort) +
+  scale_x_log10(limits = c(6e-5, NA)) +
+  geom_density(position = "stack") +
+  guides(fill=guide_legend(title="Full filters")) +
+  ylab("Density") +
+  facet_wrap(~TYPE, scales = "free_y", ncol = 2) + 
+  theme_pubr() +
+  theme(legend.position = "right", strip.background = element_blank(), strip.text = element_text(size = 12))
+
+# Combine the plots
+p_initialVAF / p_cohortMaskVAF + plot_annotation(tag_levels = "A")
+
+png(paste0(localPath, 'pQC_variantFilters.png'), height=10, width=12)
+p_initialVAF/p_cohortMaskVAF + plot_annotation(tag_levels = "A")
+dev.off()
+
+```
+
+
+### PostFilter Contam
+```{r postFilterContam, fig.height=7, fig.width=7}
+
+burdensPost <- burdens |> 
+  left_join(filteredVars |> 
+              filter(TYPE %in% c("snv", "dnv", "mnv")) |> 
+              group_by(Sample_PD_ID) |> summarize(mutsPost = sum(TIMES_CALLED), mutsPostSingle = n()), by = "Sample_PD_ID") |> 
+  left_join(filteredVars |> 
+              filter(TYPE %in% c("del", "ins")) |> 
+              group_by(Sample_PD_ID) |> summarize(indelsPost = sum(TIMES_CALLED), indelsPostSingle = n()) , by = "Sample_PD_ID") |> 
+  left_join(filteredVars |> filter(BAM_VAF < 0.01 & DUPLEX_VAF < 0.1) |> 
+              filter(TYPE %in% c("snv", "dnv", "mnv")) |> 
+              group_by(Sample_PD_ID) |> summarize(mutsPost1percent = sum(TIMES_CALLED)), by = "Sample_PD_ID") |> 
+  left_join(filteredVars |> filter(BAM_VAF < 0.01 & DUPLEX_VAF < 0.1) |> 
+              filter(TYPE %in% c("del", "ins")) |> 
+              group_by(Sample_PD_ID) |> summarize(indelsPost1percent = sum(TIMES_CALLED)) , by = "Sample_PD_ID") |> 
+  mutate(across(c(indelsPost, indelsPostSingle, indelsPost1percent, mutsPost, mutsPostSingle, mutsPost1percent), ~ replace_na(.x, 0))) |> 
+  mutate(burdenPost = mutsPost/total) |> 
+  mutate(burdenPostSingle = mutsPostSingle/total) |> 
+  mutate(burdenPost1percent = mutsPost1percent/total) |> 
+  mutate(burdenIndelPost = indelsPost/total) |> 
+  mutate(burdenIndelPostSingle = indelsPostSingle/total) |> 
+  mutate(burdenIndelPost1percent = indelsPost1percent/total) 
+
+maskedCountsPost <- allCallsFilter |>
+  mutate(FILTER = if_else(FILTER == "PASS", FILTER, "MASKED")) |> 
+  mutate(TYPE = if_else(TYPE %in% c("snv", "dnv", "mnv"), "snv", "indel")) |> 
+  group_by(Sample_PD_ID, FILTER, TYPE) |> summarize(count = n(), .groups = "drop") |> 
+  pivot_wider(id_cols = Sample_PD_ID, names_from = c(FILTER,TYPE), names_sep = "_", values_from = count, values_fill = 0) |> 
+  left_join(germanTrioSperm, by = "Sample_PD_ID") |> 
+  left_join(burdensPost, by = "Sample_PD_ID") |> 
+  left_join(seqMetrics, by = "Sample_PD_ID") |> 
+  mutate(maskedProportionPost = MASKED_snv/PASS_snv) |> 
+  mutate(maskedProportionPostIndel = MASKED_indel/PASS_indel) |> 
+  left_join(maskedCounts |> select(Sample_PD_ID, maskedProportion, maskedProportionIndel), by = "Sample_PD_ID") |> 
+  left_join(filteredVars |> mutate(above1 = if_else(TIMES_CALLED > 1, 1, 0)) |> group_by(Sample_PD_ID) |> summarize(above1Vars = sum(above1))) |> 
+  mutate(above1Prop = above1Vars/mutsPostSingle) |> select(-above1Vars) |> 
+  mutate(above5 = if_else(maskedProportion > 5, T,F)) |> 
+  mutate(label = if_else((maskedProportion > 5 | burden > 1e-7), str_remove(FAM_ID, "FAM_"), "")) |> 
+  mutate(concern = if_else((maskedProportion > 5 |  burdenPost > 1e-7), T, F))
+
+```
+
+### Corrected burdens
+Using shorted version of code from NanoSeq pipeline to correct burdens for trinucleotide composition (https://github.com/cancerit/NanoSeq/blob/develop/R/nanoseq_results_plotter.R)
+```{r burdensCorrected}
+#Write out filtered and corrected burdens
+burdensCorrected0 <- burdensPost |> 
+  select(Sample_PD_ID, total, muts = mutsPost,  burden = burdenPost, indels = indelsPost, indelBurden = burdenIndelPost, burdenIndelPost1percent)
+
+# Background full genome trinuc composition
+genome_counts <- tibble(trinuc = c("ACA", "ACC", "ACG", "ACT", "ATA", "ATC", "ATG", "ATT", "CCA", "CCC", "CCG", "CCT", "CTA", "CTC", "CTG", "CTT", "GCA", "GCC", "GCG", "GCT", "GTA", "GTC", "GTG", "GTT", "TCA", "TCC", "TCG", "TCT", "TTA", "TTC", "TTG", "TTT"),
+                genomeCount = c(115415924, 66550070, 14381094, 92058521, 117976329, 76401029, 105094288, 142651503, 105547494, 75238490,
+    15801067, 101628641, 73791042, 96335416, 115950255, 114180747, 82414099, 68090507, 13621251, 80004082,
+    64915540, 54055728, 86012414, 83421918, 112085858, 88336615, 12630597, 126566213, 119020255, 112827451,
+    108406418, 219915599), totalCount = 2861326455) |> 
+  mutate(genomeFraction = genomeCount/totalCount)
+
+# Trinucleotides covered per sample and ratio to full genome
+tri_bg <- read_tsv(paste0(path, "sperm/germanTrio_data/canAppsOutput/trinuc.txt"), col_types = cols(), col_names = c("trinuc", "trinucCount", "Sample_PD_ID")) |> 
+  left_join(genome_counts, by = join_by(trinuc)) |> left_join(burdensCorrected0 |> select(Sample_PD_ID, total), by = join_by(Sample_PD_ID)) |> 
+  mutate(sampleFraction = trinucCount/total) |> 
+  mutate(ratioToGenome = sampleFraction/genomeFraction) |> 
+  select(Sample_PD_ID, trinuc, ratioToGenome)
+
+# Observed Trinuc mutations adjusted by ratio of background to genome
+burdensCorr <- filteredVars |> drop_na(TRI) |> filter(TRI != "NA") |> 
+  group_by(TRI, Sample_PD_ID) |> summarize(count = sum(TIMES_CALLED), .groups = "drop") |> 
+  mutate(trinuc = str_sub(TRI, 1, 3)) |> 
+  left_join(tri_bg, by = join_by(Sample_PD_ID, trinuc)) |> 
+  mutate(trint_onto_genome = count/ratioToGenome) |> 
+  group_by(Sample_PD_ID) |> summarize(mutsCorr = sum(trint_onto_genome)) 
+
+# Observed Trinuc mutations adjusted by ratio of background to genome
+burdensCorr1percent <- filteredVars |> filter(BAM_VAF < 0.01 & DUPLEX_VAF < 0.1) |> drop_na(TRI) |> filter(TRI != "NA") |> 
+  group_by(TRI, Sample_PD_ID) |> summarize(count = sum(TIMES_CALLED), .groups = "drop") |> 
+  mutate(trinuc = str_sub(TRI, 1, 3)) |> 
+  left_join(tri_bg, by = join_by(Sample_PD_ID, trinuc)) |> 
+  mutate(trint_onto_genome = count/ratioToGenome) |> 
+  group_by(Sample_PD_ID) |> summarize(mutsCorr1perc = sum(trint_onto_genome)) 
+
+burdensCorrected <- burdensCorrected0 |> 
+  left_join(burdensCorr1percent, by = join_by(Sample_PD_ID)) |> mutate(burdenCorr1percent = mutsCorr1perc/total) |> 
+  left_join(burdensCorr, by = join_by(Sample_PD_ID)) |> mutate(burdenCorr = mutsCorr/total) 
+
+```
+
+#### SNP burdens
+```{r contam, fig.height=7, fig.width=10}
+
+pPostMaskedProp <- ggplot(maskedCountsPost, aes(maskedProportion, maskedProportionPost, label = label)) +
+  geom_abline(slope=1, linetype = "dashed") +
+  geom_point(size=3, pch=21, col='white', stroke=0.25, fill = "maroon") +
+  geom_text_repel(colour = "grey60",
+                  arrow = arrow(angle = 0, length = unit(0.02, "npc")),
+                box.padding = 1, max.overlaps = Inf) +
+  ylim(c(0,15)) +
+  xlim(c(0,15)) +
+  xlab("Pre Filter (masked SNPs / passed variants)") +
+  ylab("Post Filter (masked SNPs / passed variants)") +
+  theme_minimal()   +
+  theme(legend.position = "none")
+pPostBurdenProp <- ggplot(maskedCountsPost, aes(x = burden, y = burdenPost, label = label)) +
+  geom_abline(slope=1, linetype = "dashed") +
+  geom_point(size=3, pch=21, col='white', stroke=0.25, fill = "maroon") +
+  geom_text_repel(colour = "grey60",
+                  arrow = arrow(angle = 0, length = unit(0.02, "npc")),
+                box.padding = 1, max.overlaps = Inf) +
+  xlab("Pre Filter Burden") +
+  ylab("Post Filter Burden") +
+  theme_minimal()  +
+  theme(legend.position = "none")
+
+ggarrange(pPostMaskedProp, pPostBurdenProp)
+
+allpostBurden <- maskedCountsPost |> 
+                  pivot_longer(cols = c(burden, burdenPost), names_to = "burdenType", values_to = "burdens") 
+pAllPostBurden <- allpostBurden |> 
+  ggplot(aes(x =  Age, y = burdens, label = label)) + 
+  geom_smooth(method='lm', alpha = 0.2) +
+  geom_point(size=3, pch=21, col='white', stroke=0.25, fill = "maroon") +
+  geom_text_repel(colour = "grey60",
+                  arrow = arrow(angle = 0, length = unit(0.02, "npc")),
+                box.padding = 1, max.overlaps = Inf) +
+  xlab('Age (years)') + 
+  ylab('Mutations per bp') + 
+  theme_minimal() + 
+  # ylim(0,1.25e-7) +
+  facet_wrap(~burdenType, nrow = 2)
+pAllPostBurden
+
+((pPostMaskedProp / pPostBurdenProp  + plot_layout(guides = 'auto')) | pAllPostBurden) + plot_layout(guides = 'collect')
+
+pdf(paste0(localPath, 'pQC_prePostFilterComp.pdf'), height=7, width=10, onefile = F)
+((pPostMaskedProp / pPostBurdenProp  + plot_layout(guides = 'auto')) | pAllPostBurden) + plot_layout(guides = 'collect')
+dev.off()
+
+```
+
+#### Indel burdens
+```{r contam, fig.height=7, fig.width=10}
+
+pPostMaskedPropIndel <- ggplot(maskedCountsPost, aes(maskedProportionIndel, maskedProportionPostIndel,  label = label)) +
+  geom_abline(slope=1, linetype = "dashed") +
+  geom_point(size=3, pch=21, col='white', stroke=0.25, fill = "maroon") +
+  geom_text_repel(colour = "grey60",
+                  arrow = arrow(angle = 0, length = unit(0.02, "npc")),
+                box.padding = 1, max.overlaps = Inf) +
+  ylim(c(0,15)) +
+  xlim(c(0,15)) +
+  xlab("Pre Filter (masked Indel / passed Indel)") +
+  ylab("Post Filter (masked Indel / passed Indel)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+pPostBurdenPropIndel <- ggplot(maskedCountsPost, aes(x = indelBurden, y = burdenIndelPost,  label = label)) +
+  geom_abline(slope=1, linetype = "dashed") +
+  geom_point(size=3, pch=21, col='white', stroke=0.25, fill = "maroon") +
+  geom_text_repel(colour = "grey60",
+                  arrow = arrow(angle = 0, length = unit(0.02, "npc")),
+                box.padding = 1, max.overlaps = Inf) +
+  xlab("Pre Filter Indel Burden") +
+  ylab("Post Filter Indel Burden") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+ggarrange(pPostMaskedPropIndel, pPostBurdenPropIndel)
+
+allpostBurdenIndel <- maskedCountsPost |> dplyr::rename(indelBurdenPost = burdenIndelPost) |> 
+                  pivot_longer(cols = c(indelBurden, indelBurdenPost), names_to = "burdenType", values_to = "burdens") |> 
+  filter(PD_ID != "PD50495b")
+pAllPostBurdenIndel <- allpostBurdenIndel |> 
+  ggplot(aes(x =  Age, y = burdens,  label = label)) + 
+  geom_smooth(method='lm', alpha = 0.2) +
+  geom_point(size=3, pch=21, col='white', stroke=0.25, fill = "maroon") +
+  geom_text_repel(colour = "grey60",
+                  arrow = arrow(angle = 0, length = unit(0.02, "npc")),
+                box.padding = 1, max.overlaps = Inf) +
+  xlab('Age (years)') + 
+  ylab('Mutations per bp') + 
+  theme_minimal() + 
+  ylim(0,NA) +
+  facet_wrap(~burdenType, nrow = 2)
+pAllPostBurdenIndel
+
+((pPostMaskedPropIndel / pPostBurdenPropIndel  + plot_layout(guides = 'auto')) | pAllPostBurdenIndel) + plot_layout(guides = 'collect')
+
+pdf(paste0(localPath, 'pQC_prePostFilterCompIndel.pdf'), height=7, width=10, onefile = F)
+((pPostMaskedPropIndel / pPostBurdenPropIndel  + plot_layout(guides = 'auto')) | pAllPostBurdenIndel) + plot_layout(guides = 'collect')
+dev.off()
+
+```
+
+## c) Filter Samples
+#### BAM cov summary
+```{bash covSumBAM, eval=FALSE}
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow
+
+mkdir -p cov/rawBamDepth/jobs
+mkdir -p cov/rawBamDepth/out
+mkdir -p cov/rawBamDepth/tmp
+
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow
+cat << 'EOF' > cov/rawBamDepth/calc_raw_depth.sh
+#!/bin/bash
+set -euo pipefail
+
+sample=$1
+bam=$2
+TARGET_BED=$3
+out=$4
+
+if [ ! -s "$bam" ]; then
+  echo -e "${sample}\tNA\tNA\tBAM_NOT_FOUND\t${bam}" > "$out"
+  exit 0
+fi
+
+# Mean on-target depth (including zero-depth bases)
+mean=$(samtools depth -a -b "$TARGET_BED" "$bam" \
+  | awk '{sum+=$3; n+=1} END {if(n>0) printf("%.6f", sum/n); else printf("NA")}')
+
+# Also record totals for QC
+stats=$(samtools depth -a -b "$TARGET_BED" "$bam" \
+  | awk '{sum+=$3; n+=1} END {printf("%d\t%d", sum, n)}')
+
+# sample  meanDepth  depthSum  nBases  status  bamPath
+echo -e "${sample}\t${mean}\t${stats}\tOK\t${bam}" > "$out"
+EOF
+
+chmod +x cov/rawBamDepth/calc_raw_depth.sh
+
+
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow
+
+TARGET_BED="<hpc_scratch>/genomicRegions/germlineV2_hg19.bed"
+
+for sample in $(cut -f1 ../samplesgermanTrio.txt | grep "PD6"); do
+  bam="<hpc_references>/nst_links/live/3472/${sample}/${sample}.sample.merged.bam"
+  out="cov/rawBamDepth/out/${sample}.meanDepth.tsv"
+
+  bsub -q normal \
+    -o cov/rawBamDepth/jobs/${sample}.out \
+    -e cov/rawBamDepth/jobs/${sample}.err \
+    -R 'select[mem>=100] rusage[mem=100] span[hosts=1]' -M 100 \
+    cov/rawBamDepth/calc_raw_depth.sh \
+      "$sample" "$bam" "$TARGET_BED" "$out"
+done
+
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow
+(
+  echo -e "sample\tmeanDepth\tdepthSum\tnBases\tstatus\tbam"
+  cat cov/rawBamDepth/out/*.meanDepth.tsv | sort -k1,1
+) > cov/rawBamDepth/rawBamDepth_summary.tsv
+```
+
+### Investigate Samples
+```{r covSummary}
+#Coverage summary
+
+covSummaryTarg <- read_tsv(paste0(path, "sperm/germanTrio_data/postNextflow/statsCoverage.tsv"), col_types = cols(), col_names = c("Sample_PD_ID", "bpUnique","bpTotal", "bpMedian", "bpUniquePanel","bpTotalPanel", "bpMedianPanel"))  |>
+  left_join(germanTrioSperm, by = "Sample_PD_ID") |> 
+  left_join(read_tsv(paste0(metaPath, "germanTrioSpermLong.tsv"), col_types = cols()) |> select(DNA_Amount_UG, Sample_PD_ID) |> 
+              bind_rows(read_xls("<local_working_dir>/OxfordTubules/meta/dnaQC.xls") |> mutate(Sample_PD_ID = paste0(SAMPLE, "_tds0001")) |> 
+  filter(Sample_PD_ID %in% OxSpermMetaBasic$Sample_PD_ID) |> select(Sample_PD_ID, DNA_Amount_UG = `TOTAL AMOUNT (UG)` )), by = join_by(Sample_PD_ID)) |>
+  mutate(percentGenomeCov = bpUnique/3135000000 * 100)|> 
+  mutate(avgDuplexCov = bpTotal/bpUnique) |> 
+  mutate(percentGenomeCovPanel = bpUniquePanel/3135000000 * 100) |> 
+  mutate(avgDuplexCovPanel = bpTotalPanel/bpUniquePanel) |> 
+  left_join(maskedCountsPost, by = join_by(Sample_PD_ID, PD_ID, FAM_ID, Age, sampleFilter, Cohort)) |> 
+  mutate(maskedProportionPost = replace_na(maskedProportionPost, 0)) |> 
+  # Has masked prop > 5
+  mutate(sampleFilter = if_else(maskedProportion > 5, "snpContam", sampleFilter)) |> 
+  # 024 is clear somatic contam. Has many high VAF variants, outlier burden and both a DMNT3A variant at 10% VAF (!) and a TET2 variant
+  # 068 has normal snv burden but outlier indel burden & 3 common blood driver indels (2*TET2,ASXL1)
+  # A2 is probable somatic contam. Has outlier burden and 2 duplex calls of V563M in DNMT3A, a known driver: https://eucentral.oncokb.org/gene/DNMT3A/V563M
+  # 172 has TET2 & DNMT3A LOFs, 192 has high vaf TET2 lof, 211 has 3 high vaf CHIP drivers, 200 has high vaf SEMG1 + TET2, 227 has several high vaf CHIP
+  mutate(sampleFilter = if_else(FAM_ID %in% c("FAM_068", "FAM_A2", "FAM_172", "FAM_192","FAM_211", "FAM_200", "FAM_227"), "somaticContam", sampleFilter)) |> 
+  mutate(sampleFilter = if_else(sampleFilter == "FULL" & (bpMedianPanel <= 200 | is.na(bpMedianPanel)), "lowCov", sampleFilter)) |>
+  mutate(label = if_else(sampleFilter != "FULL" | burdenPost > 1e-7, FAM_ID, ""))
+
+
+write_tsv(covSummaryTarg, paste0(localPath, "data/covSummaryTarg.tsv"))
+
+p_covToInput <- ggplot(covSummaryTarg, aes(x = DNA_Amount_UG, y = avgDuplexCovPanel, colour = sampleFilter)) +
+  geom_point(alpha = 0.8, size = 3) +
+  theme_bw() +
+  xlab("Input DNA (ug)") +
+  ylab("Average sperm sequenced (dx)") +
+  xlim(0,NA) +
+  ylim(0,NA)
+p_covToInput 
+
+p_burdenPerYear <- ggplot(covSummaryTarg, aes(x = avgDuplexCovPanel, y = burdenPost1percent/Age, colour = sampleFilter, label = label)) +
+  geom_point(alpha = 0.8, size = 3) +
+  geom_text_repel() +
+  theme_bw() +
+  xlim(0,NA) +
+  ylim(0,NA)
+p_burdenPerYear
+
+
+
+p_indelsPerYear <- ggplot(covSummaryTarg, aes(x = avgDuplexCovPanel, y = burdenIndelPost1percent/Age, colour = sampleFilter, label = label)) +
+  geom_point(alpha = 0.8, size = 3) +
+  geom_text_repel() +
+  theme_bw() +
+  xlim(0,NA) +
+  ylim(0,NA)
+p_indelsPerYear
+
+yo = covSummaryTarg |> mutate(yo = burdenIndelPost1percent/Age) |> filter(sampleFilter == "FULL") 
+
+p_MaskedburdenPerYear <- ggplot(covSummaryTarg, aes(x = maskedProportion, y = burdenPost1percent/Age, colour = sampleFilter, label = label)) +
+  geom_point(alpha = 0.8, size = 3) +
+  geom_text_repel() +
+  theme_bw() +
+  xlim(0,NA) +
+  ylim(0,NA)
+p_MaskedburdenPerYear
+
+p_covToBurden <- ggplot(covSummaryTarg, aes(x = Age, y = burdenPost1percent, colour = sampleFilter)) +
+  geom_point(alpha = 0.8, size = 3) +
+  theme_bw() +
+  xlim(0,NA) +
+  ylim(0,NA)
+p_covToBurden 
+
+```
+
+## d) Passed QC
+Samples/variants allowed to progress to main analyses
+```{r passQC}
+targSamplesPassingQC <- covSummaryTarg |> 
+  filter(sampleFilter == "FULL")  |> 
+  pull(Sample_PD_ID) 
+
+germanTrioSamplesFiltered <- germanTrioSperm |> 
+  filter(Sample_PD_ID %in% targSamplesPassingQC) |> 
+  select(PD_ID, FAM_ID, Age, Sample_PD_ID)
+
+#Write out filtered metadata locally
+write_tsv(germanTrioSamplesFiltered, paste0(metaPath,"germanTrioSamplesFiltered.tsv"))
+
+#Write out filtered sample list on farm
+write_tsv(germanTrioSamplesFiltered |> select(Sample_PD_ID, PD_ID), paste0(path,"sperm/germanTrio_data/germanTrioSamplesFiltered.txt"), col_names = F)
+write_tsv(germanTrioSamplesFiltered |> 
+  mutate(dataset = if_else(str_detect(Sample_PD_ID, "PD6"), "DD.fathers", "Apert.fathers")) |> 
+    select(Sample_PD_ID, dataset), paste0(path,"sperm/germanTrio_data/postNextflow/samplesCovFiltered.txt"), col_names = F)
+
+#Write out filtered burdens
+germanTrioBurdens <- burdensCorrected |> filter(Sample_PD_ID %in% germanTrioSamplesFiltered$Sample_PD_ID)
+write_tsv(germanTrioBurdens, paste0(localPath, "data/germanTrioBurdens.tsv"))
+
+#Write out filtered variant list
+write_tsv(filteredVars |> filter(Sample_PD_ID %in% germanTrioSamplesFiltered$Sample_PD_ID), paste0(localPath, "data/filteredVars.tsv"))
+
+write_tsv(allCallsFilter |> select(-sampleFilter) |> left_join(covSummaryTarg |> select(Sample_PD_ID, sampleFilter)), paste0(localPath, "data/allCallsFilterVars.tsv"))
+
+# Write out for sigs with IDs
+sigInputTjoint <- read_tsv(paste0(localPath, "data/filteredVars.tsv"), col_types = cols()) |> 
+  mutate(blank = ".") |> 
+  # ID useful for joining indels back up
+  mutate(id = paste(chr,start,ref,alt,Sample_PD_ID, sep = "_")) |> 
+  select(chr, start, id, ref, alt, blank2 = blank, blank3 = blank, blank4 = blank) |> 
+  arrange(chr, as.numeric(start)) 
+write_tsv(sigInputTjoint, paste0(path, "sperm/germanTrio_data/postNextflow/vep/sigInput.vcf"), col_names = F) 
+```
+
+#### SupFig 1
+```{r supFig1, fig.height=7, fig.width=9}
+
+# Create new labels with counts for the legend
+filter_counts_DD <- allCallsFilter |> mutate(FILTER = if_else(FILTER == "diagVar", "PASS", FILTER)) |> 
+  filter(Cohort == "DD fathers" & PD_ID %in% germanTrioSamplesFiltered$PD_ID) |> 
+  count(FILTER)
+vaf_labels_DD <- setNames(paste0(filter_counts_DD$FILTER, " (n=", filter_counts_DD$n, ")"), filter_counts_DD$FILTER)
+
+p_varFiltersDD <- allCallsFilter |> mutate(FILTER = if_else(FILTER == "diagVar", "PASS", FILTER)) |> 
+  filter(Cohort == "DD fathers" & PD_ID %in% germanTrioSamplesFiltered$PD_ID) |> 
+  mutate(TYPE = if_else(TYPE == "snv", "Substitutions", "Indels")) |> 
+  mutate(TYPE = factor(TYPE, levels = c("Substitutions", "Indels"), ordered = TRUE)) |> 
+  mutate(BAM_VAF = if_else(BAM_VAF == 0, BAM_VAF_BQ10, BAM_VAF)) |> 
+  mutate(BAM_VAF = if_else(BAM_VAF == 0, DUPLEX_VAF, BAM_VAF)) |> 
+  mutate(FILTER = factor(FILTER, levels = names(vaf_colours), ordered = TRUE)) |> 
+  ggplot(aes(BAM_VAF, after_stat(count), fill = FILTER)) +
+  scale_fill_manual(values = vaf_colours, labels = vaf_labels_DD) +
+  scale_x_log10(limits = c(6e-5, 1)) +
+  geom_density(position = "stack") +
+  guides(fill=guide_legend(title="DD father var filters")) +
+  ylab("Density") +
+  facet_wrap(~TYPE, scales = "free_y", ncol = 2) + 
+  theme_pubr() +
+  theme(legend.position = "right", strip.background = element_blank(), strip.text = element_text(size = 12))
+
+# Create new labels with counts for the legend
+filter_counts_Apert <- allCallsFilter |> filter(Cohort == "Apert fathers" & PD_ID %in% germanTrioSamplesFiltered$PD_ID) |> 
+  count(FILTER)
+vaf_labels_Apert <- setNames(paste0(filter_counts_Apert$FILTER, " (n=", filter_counts_Apert$n, ")"), filter_counts_Apert$FILTER)
+
+p_varFiltersApert <- allCallsFilter |> filter(Cohort == "Apert fathers" & PD_ID %in% germanTrioSamplesFiltered$PD_ID) |> 
+  mutate(TYPE = if_else(TYPE == "snv", "Substitutions", "Indels")) |> 
+  mutate(TYPE = factor(TYPE, levels = c("Substitutions", "Indels"), ordered = TRUE)) |> 
+  mutate(BAM_VAF = if_else(BAM_VAF == 0, BAM_VAF_BQ10, BAM_VAF)) |> 
+  mutate(BAM_VAF = if_else(BAM_VAF == 0, DUPLEX_VAF, BAM_VAF)) |> 
+  mutate(FILTER = factor(FILTER, levels = names(vaf_colours), ordered = TRUE)) |> 
+  ggplot(aes(BAM_VAF, after_stat(count), fill = FILTER)) +
+  scale_fill_manual(values = vaf_colours, labels = vaf_labels_Apert) +
+  scale_x_log10(limits = c(6e-5, 1)) +
+  geom_density(position = "stack") +
+  guides(fill=guide_legend(title="Apert father var filters")) +
+  ylab("Density") +
+  facet_wrap(~TYPE, scales = "free_y", ncol = 2) + 
+  theme_pubr() +
+  theme(legend.position = "right", strip.background = element_blank(), strip.text = element_text(size = 12))
+
+# Combine the plots
+p_varFiltersDD / p_varFiltersApert + plot_annotation(tag_levels = "A")  &
+  theme(plot.tag = element_text(size = 14, face = "bold"))
+
+
+png(paste0(manuscriptPath, 'Figures/SupFig1_varFilters.png'), height=7, width=9, res = 300, units = "in")
+p_varFiltersDD / p_varFiltersApert + plot_annotation(tag_levels = "A")  &
+  theme(plot.tag = element_text(size = 14, face = "bold"))
+dev.off()
+
+pdf(paste0(manuscriptPath, 'Figures/SupFig1_varFilters.pdf'), height=7, width=9, onefile = F)
+p_varFiltersDD / p_varFiltersApert + plot_annotation(tag_levels = "A")  &
+  theme(plot.tag = element_text(size = 14, face = "bold"))
+dev.off()
+
+```
+### Finalize coverage 
+### Coverage script
+Save as runCovFiltered.sh
+```{bash cov, eval=FALSE}
+#!/usr/bin/env bash
+# runCovFiltered.sh
+# Rebuild a filtered total coverage file from samplesCovFiltered.txt and subtract discarded sites.
+# Usage:
+#   bash runCovFiltered.sh <GROUP_NAME>
+# Example:
+#   bash runCovFiltered.sh targeted1
+
+set -euo pipefail
+
+if [ "$#" -ne 1 ]; then
+  echo "Usage: bash runCovFiltered.sh <GROUP_NAME>"
+  exit 1
+fi
+
+GROUP="$1"
+
+BASE_DIR="<hpc_scratch>/sperm/germanTrio_data/postNextflow/"
+cd "$BASE_DIR"
+
+mkdir -p cov/{jobLogs,final}
+
+SAMPLE_LIST="cov/${GROUP}_samples.filtered.txt"
+OUT_BED="cov/final/filtered.${GROUP}.totalCov.bed"
+OUT_GZ="cov/final/filtered.${GROUP}.totalCov.bed.gz"
+
+DISCARD="<hpc_scratch>/sperm/germanTrio_data/canAppsOutput/discardedCallsSimple.vcf"
+
+# Build filtered sample list from samplesCovFiltered.txt (col1=sample, col2=group)
+awk -F'\t' -v g="$GROUP" '$2==g{print $1}' samplesCovFiltered.txt > "$SAMPLE_LIST"
+
+N_SAMPLES="$(wc -l < "$SAMPLE_LIST" | tr -d ' ')"
+echo "Group: $GROUP"
+echo "Sample count: $N_SAMPLES"
+echo "Sample list: $SAMPLE_LIST"
+
+if [ "$N_SAMPLES" -eq 0 ]; then
+  echo "ERROR: No samples found for group '$GROUP' in samplesCovFiltered.txt"
+  exit 1
+fi
+
+# Always overwrite final outputs
+rm -f "$OUT_BED" "$OUT_GZ" "${OUT_GZ}.tbi" 2>/dev/null || true
+
+bsub -J "${GROUP}_finalize_filtered" \
+  -o "cov/jobLogs/${GROUP}_finalize_filtered.%J.out" \
+  -e "cov/jobLogs/${GROUP}_finalize_filtered.%J.err" \
+  -q normal \
+  -R 'select[mem>=200] rusage[mem=200] span[hosts=1]' -M 200 \
+"set -euo pipefail
+ module load bedtools2-2.29.0/ || true
+ module load htslib/ || true
+
+ TMP=\$(mktemp -d)
+
+ files=\"\"
+ while read -r sample; do
+   f=\"cov/targCut/\${sample}.cov.bed\"
+   if [ ! -s \"\$f\" ]; then
+     echo \"ERROR: missing required per-sample file: \$f\" >&2
+     rm -rf \"\$TMP\"
+     exit 1
+   fi
+   files=\"\$files \$f\"
+ done < \"${SAMPLE_LIST}\"
+
+ # Combine total coverage across samples
+ bedtools unionbedg -i \$files \
+   | awk 'BEGIN{OFS=\"\t\"}{s=0; for(i=4;i<=NF;i++) s+=\$i; print \$1,\$2,\$3,s}' \
+   > \"\$TMP/combined.bed\"
+
+ # Build discard BED (chr, pos-1, pos) from discardedCallsSimple.vcf (skip header row, ignore 3rd col)
+ awk 'BEGIN{OFS=\"\t\"}
+      NR==1{next}
+      {pos=\$2; print \$1, pos-1, pos}' \"${DISCARD}\" \
+   > \"\$TMP/discard.bed\"
+
+ # Remove discarded positions while keeping coverage column
+ bedtools intersect -v -a \"\$TMP/combined.bed\" -b \"\$TMP/discard.bed\" > \"${OUT_BED}\"
+
+ bgzip -f -c \"${OUT_BED}\" > \"${OUT_GZ}\"
+ tabix -f -p bed \"${OUT_GZ}\"
+
+ rm -rf \"\$TMP\"
+"
+
+echo "Submitted finalize-only rebuild for $GROUP (with discarded sites removed)"
+echo "Output:"
+echo "  $OUT_GZ (+ .tbi)"
+```
+
+#### Run Cov
+```{bash covRun, eval=FALSE}
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/cov/
+bash runCovFiltered.sh DD.fathers
+bash runCovFiltered.sh Apert.fathers
+```
+
+# 4. Analysis Files
+## a) Diagnostic variants
+### Force call bams
+#### Positions
+```{r callPositions}
+# Write out snps and indels separately
+diagnosticSNVs <- diagnosticVarsPos |> drop_na(start, alt) |> filter(ref != "LargeDeletion") |> 
+  filter(ref %in% c("A", "C", "T", "G") & alt %in% c("A", "C", "T", "G")) |> 
+  select(chr, start) |> 
+  arrange(chr, start) |> 
+  distinct()
+write_tsv(diagnosticSNVs, paste0(path, "sperm/germanTrio_data/postNextflow/diagnosticVars/diagnosticSites.txt"), col_names = F)
+
+diagnosticIndels <- diagnosticVarsPos |> drop_na(start, alt) |> filter(ref != "LargeDeletion") |> 
+  filter(!ref %in% c("A", "C", "T", "G") | !alt %in% c("A", "C", "T", "G")) |> 
+  select(chr, start, ref, alt) |> 
+  arrange(chr, start) |> 
+  distinct()
+write_tsv(diagnosticIndels, paste0(path, "sperm/germanTrio_data/postNextflow/diagnosticVars/mpileup/diagnosticIndels.bed"), col_names = F)
+
+```
+
+#### SNV Bam calls
+```{bash germline, eval=FALSE}
+
+# Force check diag sites in all indivs at all diag positions
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/diagnosticVars
+mkdir -p mpileup/
+mkdir -p jobLogs/
+rm jobLogs/*
+for sample in `cut -f1 ../../samplesgermanTrio.txt`;
+  do echo $sample
+  bsub -q normal -e jobLogs/germ.$sample.err -o jobLogs/germ.$sample.out -R 'select[mem>=1000] rusage[mem=1000]' -M1000 "module load bcftools-1.9/; bcftools mpileup -f <hpc_references>/pipeline_ref/Human/GRCh37d5/genome.fa -d 15000 -q 30 -a AD,ADF,ADR --ff UNMAP,SECONDARY,QCFAIL,DUP -R diagnosticSites.txt ../neatCrams/$sample.sample.neat.cram > mpileup/$sample.vcf"
+done
+
+#Group results for all
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/diagnosticVars
+rm diagBamCalls.tsv
+for sample in `cut -f1 ../../samplesgermanTrio.txt`;
+  do echo $sample
+  grep -v "#" mpileup/$sample.vcf | sed "s/$/\t$sample/" >> diagBamCalls.tsv
+done
+
+```
+
+#### Indel Calls bam2R
+runBam2r_indelCov.R file
+```{r collapse, eval=FALSE}
+suppressPackageStartupMessages({
+  library(deepSNV)
+})
+suppressPackageStartupMessages({
+  library(tidyverse)
+})
+
+args = commandArgs(trailingOnly = TRUE)
+sample = args[1] #neat NanoSeq BAM
+
+if (length(args) != 1) {
+  cat("Wrong number of arguments\n")
+  quit(save = "no", status = 1)
+}
+
+path = "<hpc_scratch>/sperm/germanTrio_data/"
+dedup_bam <- paste0(path, "postNextflow/neatCrams/", sample, ".sample.neat.cram")
+
+i = 1
+indels_final <- read_tsv(paste0(path, "postNextflow/diagnosticVars/mpileup/diagnosticIndels.bed"), col_names = c("chr", "pos", "ref", "alt"), col_types = cols()) |> 
+  mutate(TYPE = if_else(str_length(ref) > str_length(alt), "del", "ins")) |> 
+  # mutate(start = pos - 1) |> 
+  # mutate(end = pos + str_length(ref) + 1) |> 
+  as.data.frame() |> 
+  drop_na()
+
+for (i in c(1:nrow(indels_final))) {
+  print(paste("Running indel", i, "\ns"))
+    kk = bam2R(dedup_bam, indels_final[i, "chr"], indels_final[i, "pos"], indels_final[i, "pos"], q = 20, mask = 3844, mq = 30)
+    total_cov = sum(kk[1, c("A", "C", "G", "T", "a", "c", "g", "t","DEL","INS","del","ins")], na.rm = T)
+    if (indels_final[i, "TYPE"] == "del") {
+      total_mut = sum(kk[, c("DEL", "del")])
+    } else {
+      #ins
+      total_mut = sum(kk[, c("INS", "ins")])
+    }
+    indels_final[i, "BAM_MUT"] = total_mut
+    indels_final[i, "BAM_COV"] = total_cov
+    indels_final[i, "BAM_VAF"] = total_mut / total_cov
+}
+
+write_tsv(indels_final, paste0(path, "postNextflow/diagnosticVars/bam2r/", sample, ".bamIndelCov.tsv"))
+
+```
+
+##### Submit bam2R
+```{bash bam2r, eval=FALSE}
+# Force check diag sites in all indivs at all diag positions
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/diagnosticVars/bam2r
+mkdir -p jobLogs/
+rm jobLogs/bam2r*
+
+for sample in $(cut -f1 ../../../samplesgermanTrio.txt); do
+  echo $sample
+  bsub -q normal -e jobLogs/bam2r.$sample.err -o jobLogs/bam2r.$sample.out -R "select[mem>=2000] rusage[mem=2000]" -M2000 \
+    "module purge; \
+    export REF_CACHE=/lustre/scratch126/core/sciops_repository/cram_cache/%2s/%2s/%s; \
+    export REF_PATH=/lustre/scratch125/core/sciops_repository/cram_cache/%2s/%2s/%s:/lustre/scratch126/core/sciops_repository/cram_cache/%2s/%2s/%s:URL=http://refcache.dnapipelines.sanger.ac.uk:8000/%s; \
+    module load HGI/softpack/groups/hgi/ubeR; \
+    Rscript runBam2r_indelCov.R $sample.sample.neat"
+done
+
+#Group results for all
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/diagnosticVars
+rm diagBamIndelCalls.tsv
+for sample in `cut -f1 ../../samplesgermanTrio.txt`;
+  do echo $sample
+  grep -v "chr" bam2r/$sample.sample.neat.bamIndelCov.tsv | sed "s/$/\t$sample/" >> diagBamIndelCalls.tsv
+done
+```
+
+#### Process calls
+```{r bamCalls}
+bamDiagnosticVars <- read_tsv(paste0(path, "sperm/germanTrio_data/postNextflow/diagnosticVars/diagBamCalls.tsv"), col_types = 'ci-cc----cc', col_names = c("chr", "pos", "ref", "alt", "FORMAT","Sample_PD_ID")) |> 
+  distinct() |> 
+  separate(FORMAT, into = c("PL", "ADF", "ADR", "AD"), sep = ":") |> 
+  select(-c(PL, ADF, ADR)) |> 
+  mutate(alt = str_replace(alt, ",<\\*>", "")) |> mutate(alt = str_replace(alt, "<\\*>", ".")) |> 
+  separate(AD, into = c("ReadsREF", "ReadsAlt1", "ReadsAlt2", "ReadsAlt3"), sep = ",", fill = "right") |> 
+  mutate(across(starts_with("Reads"), ~as.numeric(replace_na(., "0")))) |> 
+  mutate(altReads = ReadsAlt1 + ReadsAlt2 + ReadsAlt3) |> 
+  mutate(BAM_COV = ReadsREF + altReads) |> 
+  # Split by allele
+  mutate(alt = strsplit(as.character(alt), ",")) |> 
+  unnest(alt) |>
+  group_by(chr, pos, ref, Sample_PD_ID, BAM_COV) |>
+  mutate(
+    altReads = case_when(
+      row_number() == 1 ~ ReadsAlt1,
+      row_number() == 2 ~ ReadsAlt2,
+      row_number() == 3 ~ ReadsAlt3,
+      TRUE ~ NA_real_
+    )) |>
+  ungroup() |> 
+  select(-c(ReadsAlt1,ReadsAlt2,ReadsAlt3, ReadsREF)) |> 
+  # Calculate VAF of correct base call
+  left_join(diagnosticVarsPos |> select(chr, pos = start, altVar = alt) |> distinct(), by = join_by(chr, pos)) |> 
+  mutate(BAMcalls = if_else(altVar == alt, altReads, 0)) |> 
+  mutate(BAM_VAF = BAMcalls/BAM_COV) |> 
+  group_by(chr,pos,ref,altVar,Sample_PD_ID) |> summarize(BAMcalls = max(BAMcalls), BAM_COV = max(BAM_COV), BAM_VAF = max(BAM_VAF), .groups = "drop") |> 
+  rename(alt = altVar) |> 
+  filter(str_length(ref) == 1 & str_length(alt) == 1) |> 
+  # Add indel variants
+  bind_rows(read_tsv(paste0(path, "sperm/germanTrio_data/postNextflow/diagnosticVars/diagBamIndelCalls.tsv"), col_types = 'cicc-ii-c', col_names = c("chr", "pos", "ref", "alt", "BAMcalls", "BAM_COV", "Sample_PD_ID")) |> 
+              mutate(BAM_VAF = BAMcalls/BAM_COV)) |> 
+  rename(start = pos) |> 
+  left_join(diagnosticVarsPos |> select(chr,start,ref,alt,VAR_ID) |> distinct(), by = join_by(chr, start, ref, alt)) |> 
+  drop_na(VAR_ID) |> distinct()
+
+
+cohortSumm <- bamDiagnosticVars |> 
+  left_join(diagnosticVarsPos |> left_join(germanTrioSperm |> select(Sample_PD_ID, FAM_ID), by = join_by(FAM_ID)) |> 
+              select(Sample_PD_ID, VAR_matched = VAR_ID) |> 
+              distinct(), 
+            by = join_by(Sample_PD_ID), relationship = "many-to-many") |> 
+  mutate(group = if_else(VAR_matched == VAR_ID, "Target", "Cohort")) |> 
+  select(-VAR_matched) |> 
+  filter(group == "Cohort") |> 
+  group_by(chr, start, ref, alt, VAR_ID, group) |> 
+  summarize(BAMcalls = sum(BAMcalls), BAM_COV = sum(BAM_COV), .groups = "drop")
+
+indivBAMCov <- bamDiagnosticVars |> 
+  left_join(diagnosticVarsPos |> left_join(germanTrioSperm |> select(Sample_PD_ID, FAM_ID), by = join_by(FAM_ID)) |> 
+              select(Sample_PD_ID, VAR_matched = VAR_ID) |> 
+              distinct(), 
+            by = join_by(Sample_PD_ID), relationship = "many-to-many") |> 
+  mutate(group = if_else(VAR_matched == VAR_ID, "Target", "Cohort")) |> 
+  select(-VAR_matched) |> 
+  filter(group == "Target") |> 
+  bind_rows(cohortSumm) |> 
+  mutate(BAM_VAF = BAMcalls / BAM_COV)
+
+```
+
+### Duplex
+#### Diagnostic Vars
+```{r collapse}
+diagnosticVarsPosExpandBed <- read_tsv(paste0(metaPath, "diagnosticVarsPos.txt"), col_types = cols()) |> 
+  mutate(startBed = start - 1) |> 
+  mutate(endBed = start + str_length(ref) - 1) |> 
+  select(chr, startBed, endBed) |> 
+  arrange(chr, startBed) |> drop_na()
+write_tsv(diagnosticVarsPosExpandBed, paste0(path, "sperm/germanTrio_data/postNextflow/diagnosticVars/duplexCov/diagnosticVarsPosExpand.bed"), col_names = F)
+
+```
+
+##### Cov bed intersect
+```{bash collapse, eval=FALSE}
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/diagnosticVars/
+mkdir -p duplexCov/
+mkdir -p duplexCov/jobLogs/
+
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/diagnosticVars/duplexCov/
+sort -k1,1 -k2,2n diagnosticVarsPosExpand.bed > diagnosticVarsPosExpand.sorted.bed
+rm jobLogs/*
+for sample in `cut -f1 ../../../samplesgermanTrio.txt`;
+  do echo $sample
+  bsub -o jobLogs/intersect.$sample.out -e jobLogs/intersect.$sample.err -q normal -R 'select[mem>=1000] rusage[mem=1000] span[hosts=1]' -M 1000 "module load bedtools2-2.29.0/; bedtools intersect -a ../../cov/source/$sample.cov.bed -b diagnosticVarsPosExpand.sorted.bed -wa > $sample.diag.cov.bed"
+done
+
+# Group results
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/diagnosticVars/duplexCov/
+rm allDiagCov.bed
+for sample in `cut -f1 ../../../samplesgermanTrio.txt`;
+  do echo $sample
+  sed "s/$/\t$sample/" $sample.diag.cov.bed >> allDiagCov.bed
+done
+
+```
+
+##### Process duplex Cov
+```{r collapse}
+# Process cov
+diagnosticVarsCov <- read_tsv(paste0(metaPath, "diagnosticVarsPos.txt"), col_types = cols()) |> 
+  drop_na(start, ref) |> 
+  mutate(length = str_length(ref))|> 
+  rowwise() |> 
+  do({
+    copy_count <- seq_len(.$length)
+    data.frame(
+      chr = rep(.$chr, .$length),
+      start = rep(.$start, .$length),
+      length = rep(.$length, .$length),
+      VAR_ID = rep(.$VAR_ID, .$length), 
+      pos = .$start + copy_count - 1
+    )
+  }) |> 
+  ungroup() |> distinct() |> 
+  # Add coverage
+  left_join(read_tsv(paste0(path, "sperm/germanTrio_data/postNextflow/diagnosticVars/duplexCov/allDiagCov.bed"), col_types = 'c-dcc', col_names = c("chr", "pos", "DUPLEX_COV", "Sample_PD_ID")) |> distinct() |> 
+  mutate(DUPLEX_COV = as.numeric(str_sub(DUPLEX_COV, 7, -1))), relationship = "many-to-many", by = join_by(pos, chr)) |> 
+  mutate(DUPLEX_COV = replace_na(DUPLEX_COV, 0)) |> 
+  group_by(chr, start,length, VAR_ID, Sample_PD_ID) |> summarize(DUPLEX_COV = mean(DUPLEX_COV), .groups = "drop") |> 
+  filter(VAR_ID %in% (diagnosticVarsPos |> filter(FAM_ID %in% germanTrioSamplesFiltered$FAM_ID) |> pull(VAR_ID))) |> 
+  select(-length) |> 
+  left_join(germanTrioSperm |> select(Sample_PD_ID, FAM_ID), by = join_by(Sample_PD_ID))
+
+cohortVarCov <- diagnosticVarsCov |> 
+  group_by(chr, start, VAR_ID) |> summarize(totalCov = sum(DUPLEX_COV), meanCov = mean(DUPLEX_COV), count = n(), .groups = "drop") |> 
+  mutate(count = if_else(totalCov == 0, 0, count)) 
+
+# Anchor on diagnosticVarsPos (one row per FAM_ID x VAR_ID, always complete) rather
+# than on diagnosticVarsCov. A variant with 0 reads across every sample has no row
+# at all in allDiagCov.bed, so diagnosticVarsCov loses the Sample_PD_ID/FAM_ID for
+# it (collapses to a single NA-keyed row) - starting the join from diagnosticVarsCov
+# then silently dropped that variant/family entirely instead of showing 0 coverage.
+# A family with no sperm sample at all (Sample_PD_ID unknown, i.e. patSpermSequenced
+# == "No") is kept as NA throughout - only "sequenced but 0 reads" becomes 0. VAF is
+# NA whenever coverage is 0 (or unsequenced), since it's undefined, not 0.
+indivVarCov <- diagnosticVarsPos |>
+  select(FAM_ID, VAR_ID, ref, alt, chr, start) |>
+  distinct() |>
+  left_join(germanTrioSperm |> select(Sample_PD_ID, FAM_ID), by = join_by(FAM_ID), relationship = "many-to-many") |>
+  left_join(diagnosticVarsCov |> select(chr, start, VAR_ID, Sample_PD_ID, manualCov = DUPLEX_COV), by = join_by(chr, start, VAR_ID, Sample_PD_ID)) |>
+  mutate(manualCov = if_else(is.na(Sample_PD_ID), NA_real_, replace_na(manualCov, 0))) |>
+  left_join(read_tsv(paste0(localPath, "data/germanTrioAllTargVars.tsv"), col_types = cols()) |> select(chr, start, ref, alt, FAM_ID, TIMES_CALLED, DUPLEX_VAF), by = join_by(chr, start, ref, alt, FAM_ID)) |>
+  mutate(TIMES_CALLED = if_else(is.na(Sample_PD_ID), NA_real_, replace_na(TIMES_CALLED, 0))) |>
+  mutate(DUPLEX_VAF = replace_na(DUPLEX_VAF, 0)) |>
+  mutate(DUPLEX_VAF = if_else(is.na(manualCov) | manualCov == 0, NA_real_, DUPLEX_VAF)) |>
+  full_join(cohortVarCov, by = join_by(chr, start, VAR_ID)) |> drop_na(FAM_ID) |>
+  mutate(totalCov = replace_na(totalCov, 0)) |>
+  left_join(read_tsv(paste0(localPath, "data/germanTrioAllTargVars.tsv"), col_types = cols()) |> group_by(chr, start, ref, alt) |> summarize(cohortCalls = sum(TIMES_CALLED), .groups = "drop"), by = join_by(chr, start, ref, alt)) |>
+  mutate(cohortCalls = replace_na(cohortCalls, 0)) |>
+  mutate(nonTargetCalls = cohortCalls - coalesce(TIMES_CALLED, 0)) |>
+  mutate(nonTargetVAF = if_else(totalCov == 0, NA_real_, nonTargetCalls/totalCov))
+
+diagnosticVarsCalls <- indivVarCov |> select(VAR_ID, FAM_ID, chr,start,ref,alt, duplexCalls = nonTargetCalls, duplexCov = totalCov, duplexVAF = nonTargetVAF) |> mutate(group = "Cohort", FAM_ID = "Cohort") |>
+  bind_rows(indivVarCov |> select(VAR_ID, FAM_ID, chr,start,ref,alt, Sample_PD_ID, duplexCalls = TIMES_CALLED, duplexCov = manualCov, duplexVAF = DUPLEX_VAF) |> mutate(group = "Target")) |>
+  left_join(indivBAMCov |> left_join(germanTrioSperm |> select(Sample_PD_ID, FAM_ID), by = join_by(Sample_PD_ID)) |> select(-Sample_PD_ID), by = join_by(VAR_ID, FAM_ID, chr, start, ref, alt, group)) |>
+  # Same 0-vs-NA rule as duplex above, but tracked independently: BAM and duplex
+  # coverage come from separate pipelines, so a variant can have 0 duplex reads yet
+  # real BAM coverage (or vice versa) - never infer one from the other.
+  mutate(BAMcalls = if_else(group == "Target" & is.na(Sample_PD_ID), NA_real_, replace_na(BAMcalls, 0))) |>
+  mutate(BAM_COV = if_else(group == "Target" & is.na(Sample_PD_ID), NA_real_, replace_na(BAM_COV, 0))) |>
+  mutate(BAM_VAF = if_else(is.na(BAM_COV) | BAM_COV == 0, NA_real_, BAMcalls / BAM_COV)) |>
+  left_join(diagnosticVarsPos |> select(VAR_ID, gene) |> distinct()) |>
+  arrange(VAR_ID) |> distinct() |>
+  mutate(varLabel = gene) |>
+  mutate(varLabel = if_else(coalesce(duplexCalls, 0) > 0, varLabel, "")) |>
+  select(-Sample_PD_ID) |>
+  mutate(Cohort = if_else(str_detect(FAM_ID, "FAM_A"),  "Apert fathers", "DD fathers"))
+
+write_tsv(diagnosticVarsCalls, paste0(localPath, "data/diagnosticVarsCalls.tsv"))
+```
+
+
+#### Other vars
+```{r collapse}
+
+trioDNM_Vars <- read_tsv(paste0(metaPath, "trioDNM_Vars.tsv"), col_types = cols())
+
+famsIncluded <- germanTrioMeta |> filter(PD_ID %in% trioDNM_Vars$PD_ID)
+spermIndivs <- germanTrioSamplesFiltered |> filter(FAM_ID %in% famsIncluded$FAM_ID)
+
+trioPosExpandBed <- trioDNM_Vars |> 
+  left_join(germanTrioSamplesFiltered |> select(Sample_PD_ID, FAM_ID), by = join_by(FAM_ID)) |> 
+  drop_na(Sample_PD_ID) |> # Only take variants in retained sperm samples
+  mutate(startBed = start - 1) |> 
+  mutate(endBed = start + str_length(ref) - 1) |> 
+  select(chr, startBed, endBed, Sample_PD_ID) |> 
+  arrange(chr, startBed) |> drop_na()
+write_tsv(trioPosExpandBed, paste0(path, "sperm/germanTrio_data/postNextflow/diagnosticVars/duplexCovAll/trioPosExpandBed.bed"), col_names = F)
+
+```
+
+##### Cov bed intersect
+```{bash collapse, eval=FALSE}
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/diagnosticVars/
+mkdir -p duplexCovAll/
+mkdir -p duplexCovAll/jobLogs/
+
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/diagnosticVars/duplexCovAll/
+sort -k1,1 -k2,2n trioPosExpandBed.bed > trioPosExpandBed.sorted.bed
+rm jobLogs/*
+for sample in `cut -f1 ../../../germanTrioSamplesFiltered.txt`;
+  do echo $sample
+  bsub -o jobLogs/intersect.$sample.out -e jobLogs/intersect.$sample.err -q normal -R 'select[mem>=100] rusage[mem=100] span[hosts=1]' -M 100 "module load bedtools2-2.29.0/; grep '$sample' trioPosExpandBed.sorted.bed \
+  | bedtools intersect -a ../../cov/source/$sample.cov.bed -b - -wa \
+  > $sample.dnms.cov.bed"
+done
+
+# Group results
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/diagnosticVars/duplexCovAll/
+rm allDNMsCov.bed
+for sample in `cut -f1 ../../../germanTrioSamplesFiltered.txt`;
+  do echo $sample
+  sed "s/$/\t$sample/" $sample.dnms.cov.bed >> allDNMsCov.bed
+done
+
+```
+
+##### Process duplex Cov
+```{r collapse}
+# Process cov
+allDNMsCov0 <- trioDNM_Vars |> 
+  left_join(germanTrioSamplesFiltered |> select(Sample_PD_ID, FAM_ID), by = join_by(FAM_ID)) |> 
+  drop_na(Sample_PD_ID) |> # Only take variants in retained sperm samples
+  mutate(length = str_length(ref)) |> 
+  rowwise() |> 
+  do({
+    copy_count <- seq_len(.$length)
+    data.frame(
+      chr = rep(.$chr, .$length),
+      start = rep(.$start, .$length),
+      length = rep(.$length, .$length),
+      PD_ID = rep(.$PD_ID, .$length), 
+      Sample_PD_ID = rep(.$Sample_PD_ID, .$length), 
+      pos = .$start + copy_count - 1
+    )
+  }) |> 
+  ungroup() |> distinct()|> 
+  # Add coverage
+  left_join(read_tsv(paste0(path, "sperm/germanTrio_data/postNextflow/diagnosticVars/duplexCovAll/allDNMsCov.bed"), col_types = 'c-dcc', col_names = c("chr", "pos", "DUPLEX_COV", "Sample_PD_ID")) |> distinct() |> 
+  mutate(DUPLEX_COV = as.numeric(str_sub(DUPLEX_COV, 7, -1))), by = join_by(pos, chr, Sample_PD_ID)) |> 
+  mutate(DUPLEX_COV = replace_na(DUPLEX_COV, 0)) |> 
+  group_by(chr, start,length, Sample_PD_ID, PD_ID) |> summarize(DUPLEX_COV = mean(DUPLEX_COV), .groups = "drop") |> 
+  select(-length) |> left_join(diagnosticVars |> select(chr, start, FAM_ID, VAR_ID) |> mutate(diagVar = T)) |> 
+  mutate(diagVar = replace_na(diagVar, F)) |> 
+  filter(!diagVar)
+  # Check if actually a diagnostic Var
+
+table(allDNMsCov0 |> mutate(anyCov = if_else(DUPLEX_COV>0, T, F)) |> pull(anyCov))
+
+allDNMsCov <- allDNMsCov0 |> filter(DUPLEX_COV>0) |> 
+  left_join(germanTrioTargVars |> select(chr, start, Sample_PD_ID, TIMES_CALLED, DUPLEX_COV))
+
+write_tsv(allDNMsCov, paste0(localPath, "data/allDNMsCov.tsv"))
+```
+
+## b) VEP 
+### Setup files
+#### ClinVar + CADD
+```{bash CADD, eval=FALSE}
+cd <hpc_shared>/External_databases/Variants/ClinVar/GRCh37/
+wget https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh37/clinvar_20250729.vcf.gz
+wget https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh37/clinvar_20250729.vcf.gz.tbi
+wget https://kircherlab.bihealth.org/download/CADD/v1.7/GRCh37/whole_genome_SNVs.tsv.gz.tbi
+echo "wget https://kircherlab.bihealth.org/download/CADD/v1.7/GRCh37/whole_genome_SNVs.tsv.gz" | bsub -o cadd.out -e cadd.err -q normal -R 'select[mem>=100] rusage[mem=100] span[hosts=1]' -M100 
+
+
+# Converting cadd to vcf for custom annotation bc I can't get plugin to work
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/vep
+nano caddToVCF.sh
+#!/bin/bash
+
+# Paths
+SNV_FILE="<hpc_shared>/External_databases/Variants/CADD/GRCh37/whole_genome_SNVs.tsv.gz"
+COVERED_BED="<hpc_scratch>/genomicRegions/germlineV1+V2_merged_hg19.bed"
+
+module load bedtools2-2.29.0/
+
+# Process: Convert to BED format, intersect with covered regions, convert to VCF, compress
+gunzip -c "$SNV_FILE" \
+  | tail -n +3 \
+  | awk -F"\t" 'BEGIN {OFS="\t"} {print $1, $2 - 1, $2, $1, $2, ".", $3, $4, ".", ".", "CADD="$6}' \
+  | bedtools intersect -a stdin -b "$COVERED_BED" -wa \
+  | cut -f4- \
+  | bgzip > cadd0.vcf.gz
+tabix -p vcf cadd0.vcf.gz
+
+chmod +x caddToVCF.sh
+bsub -o jobLogs/cadd.out -e jobLogs/cadd.err -q long -R 'select[mem>=1000] rusage[mem=1000] span[hosts=1]' -M1000 ./caddToVCF.sh
+
+```
+
+#### Methylation 
+```{bash methProcess, eval=FALSE}
+cd <hpc_scratch>/genomicRegions/methylation
+
+nano cov3Convert.sh
+#!/bin/bash
+#Select min coverage 3, take average methylation across samples, replace coverage count with mean methylation %
+module load bedtools2-2.29.0/
+
+cat ENCFF715DMX.bed ENCFF638QVP.bed | awk '$10>2' | sort -k1,1 -k2,2n | bedtools merge -d -1 -c 4,11,6 -o distinct,mean,distinct > liftover/testis_cov3_38.bed
+
+#LiftOver to hg19
+module load liftOverReport/2.2.1
+
+liftOver liftover/testis_cov3_38.bed liftover/hg38ToHg19.over.chain.gz testis_cov3_19.bed liftover/testis_cov3_38_unmapped.bed
+
+# Remove "chr" prefix from chromosome field
+sed 's/^chr//' testis_cov3_19.bed > testis_cov3_19noCHR.bed
+
+# Extract columns 1-3 and 5, sort, bgzip, and index
+cut -f1-3,5 testis_cov3_19noCHR.bed \
+  | sort -k1,1 -k2,2n \
+  | bedtools merge -d -1 -c 4 -o mean \
+  | bgzip -c > testisMeth19.bed.gz
+
+tabix -p bed testisMeth19.bed.gz
+
+gunzip testisMeth19.bed.gz > testisMeth19.germanTrioCov.bed
+
+#Farm job submissions
+bsub -o out.%J -e err.%J -q normal -n 1 -R 'select[mem>=1000] rusage[mem=1000]' -M1000 ./cov3Convert.sh
+
+```
+
+#### TriNuc Annotation
+```{bash trinucCov, eval=FALSE}
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/cov
+nano triNucBed.sh
+
+#!/bin/bash
+set -euo pipefail
+
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/cov
+SAMPLE_LIST=../../germanTrioSamplesFiltered.txt
+
+rm -f triNucLong.txt
+cut -f1 "$SAMPLE_LIST" | while read sample; do
+    cut -f1 -d ";" source/${sample}.cov.bed | cut -f1,3,4 >> triNucLong.txt
+done
+
+sort -T tmp -k1,1 -k2,2n triNucLong.txt | uniq > triNucUniq.txt
+awk 'BEGIN {FS=OFS="\t"} {print $1, $2-1, $2, $3}' triNucUniq.txt | bgzip -c > triNucUniq.bed.gz
+tabix -p bed triNucUniq.bed.gz
+
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/cov
+bsub -o jobLogs/triNuc.%J.out -e jobLogs/triNuc.%J.err -q normal -R 'select[mem>=10000] rusage[mem=10000] span[hosts=1]' -M 10000 ./triNucBed.sh
+```
+
+#### Trio DNMs
+```{bash trioDNMs, eval=FALSE}
+
+for f in \
+  <hpc_scratch>/GermanTrio_analyses_Project3500/Caveman/trio_cgpvaf_snp/F*/*_denovo_mutations_appended.vcf \
+  <hpc_scratch>/GermanTrio_analyses_Project3500/Caveman/trio_cgpvaf_indels/F*/*_denovo_indel_mutations_appended.vcf
+do
+  id=$(basename "$f" | sed -E 's/_denovo(_indel)?_mutations_appended\.vcf$//')
+  grep -v '^#' "$f" | awk -v id="$id" '{print $0 "\t" id}'
+done > <hpc_scratch>/sperm/germanTrio_data/dnmData/trioDNMs.tsv
+
+```
+
+#### VAFs
+```{bash trioDNMs, eval=FALSE}
+
+cd <hpc_scratch>/sperm/germanTrio_data/dnmData
+
+# Merge SNP VAFs
+for f in <hpc_scratch>/GermanTrio_analyses_Project3500/Caveman/trio_cgpvaf_snp/F*/*_denovo_mutations.txt; do
+    awk 'BEGIN{OFS="\t"} NR==1{split($27,a,"_"); id=a[1]} NR>1{print $1,$2,$3,$4,id,$27}' "$f"
+done > merged_denovo_mutationsVAFs.txt
+
+# Merge indel VAFs and append
+for f in <hpc_scratch>/GermanTrio_analyses_Project3500/Caveman/trio_cgpvaf_indels/F*/*_denovo_indel_mutations.txt; do
+    awk 'BEGIN{OFS="\t"} NR==1{split($21,a,"_"); id=a[1]} NR>1{print $1,$2,$3,$4,id,$21}' "$f"
+done >> merged_denovo_mutationsVAFs.txt
+
+# Add header
+sed -i '1i chr\tstart\tref\talt\tPD_ID\tVAF' merged_denovo_mutationsVAFs.txt
+
+```
+
+#### Mosaic data sets
+```{r mosaicSources}
+
+# Convert evrony set to 37
+evronySet <- read_excel(paste0(localPath, "externalData/mosaicVarsEvrony2025.xlsx")) |> 
+    filter(`Sample type` == "Sperm" ) |>
+      mutate(ID = paste0(ID, Timepoint)) |> 
+    # Filter to callable range 1-30%
+    filter(VAF >= 0.01 & VAF < 0.3) |> 
+    mutate(set = "E25") |> 
+    select(CHROM:ALT, ID, VAF, set) |> 
+  mutate(varID = paste(CHROM,POS, sep = "_"))
+write_tsv(evronySet |> mutate(bedStart = POS -1) |> select(CHROM, bedStart, POS, varID), paste0(localPath, "externalData/evronyVars38.bed"), col_names = F)
+
+#Read in liftover output
+evronySet37 <- evronySet |> select(-c(CHROM, POS)) |> 
+  left_join(read_tsv(paste0(localPath, "externalData/evronyVars37.bed"), col_names = c('CHROM', 'POS', 'varID'),  col_types = 'c-ic') |> 
+  mutate(CHROM = str_remove(CHROM, "chr")) |> distinct(), by = join_by(varID)) |> 
+  select(-varID)
+
+mosaicVars <- read_excel(paste0(localPath, "externalData/mosaicVarsGleeson2021.xlsx"), col_types = c("guess", "text", rep("guess", 60))) |> 
+  filter(SET_SPERM_MOSAIC == 1) |> 
+  # Filter to callable range 1-30%
+  filter(MAF_SPERM_A >= 0.01 & MAF_SPERM_A < 0.3) |> 
+  # Filter to cov ~300x samples
+  filter(str_detect(INDIVIDUAL, "ID")) |> 
+  mutate(set = "G21") |> 
+  select(CHROM:ALT, ID = INDIVIDUAL, VAF = MAF_SPERM_A, set) |> 
+  bind_rows(read_excel(paste0(localPath, "externalData/mosaicVarsGleeson2022.xlsx"), col_types = c("guess","guess", "text", rep("guess", 33))) |> 
+    filter(str_detect(ID, "Sperm") & SD_SPERM_AF > 0) |> 
+    # Filter to callable range 1-30%
+    filter(SD_SPERM_AF >= 0.01 & SD_SPERM_AF < 0.3) |> 
+    mutate(set = "G22") |> 
+    select(CHROM:ALT, ID = FAMILY_ID, VAF = SD_SPERM_AF, set))|> 
+  bind_rows(evronySet37) |> 
+  rename(chr = CHROM, start = POS, ref = REF, alt = ALT)
+
+write_tsv(mosaicVars, paste0(localPath, "externalData/mosaicVars0.tsv"))
+```
+
+### Run Variants
+#### Format calls for VEP
+```{r formatCalls}
+# Variant calls
+vepInputTjoint <- read_tsv(paste0(localPath, "data/allCallsFilterVars.tsv"), col_types = cols()) |> 
+  mutate(blank = ".") |> 
+  # ID useful for joining indels back up
+  mutate(id = paste(chr,start,ref,alt, sep = "_")) |> 
+  select(chr, start, id, ref, alt, blank2 = blank, blank3 = blank, blank4 = blank) |> 
+  arrange(chr, as.numeric(start)) |> 
+  distinct()
+write_tsv(vepInputTjoint, paste0(path, "sperm/germanTrio_data/postNextflow/vep/allCallsFilterVars.vcf"), col_names = F) 
+
+# Discarded calls - Commented to prevented accidental run
+# discardedVepInput <- anyCounts <- read_tsv(paste0(path, "sperm/germanTrio_data/canAppsOutput/discardedCalls.vcf"), col_names = c("chr", "start", "ref", "alt", "FILTER","info", "Sample_PD_ID"), col_types = 'cd-cc-ccc') |> 
+#   mutate(blank = ".") |> 
+#   # ID useful for joining indels back up
+#   mutate(id = paste(chr,start,ref,alt, sep = "_")) |> 
+#   select(chr, start, id, ref, alt, blank2 = blank, blank3 = blank, blank4 = blank) |> 
+#   arrange(chr, as.numeric(start)) |> 
+#   distinct()
+# write_tsv(discardedVepInput, paste0(path, "sperm/germanTrio_data/postNextflow/vep/discardedCallsVars.vcf"), col_names = F) 
+
+# Diagnostic variants
+vepInputdiagnosticVars <- read_tsv(paste0(metaPath, "diagnosticVarsPos.txt"), col_types = cols()) |> 
+  mutate(blank = ".") |> 
+  # ID useful for joining indels back up
+  mutate(id = paste(chr,start,ref,alt, sep = "_")) |> 
+  select(chr, start, id, ref, alt, blank2 = blank, blank3 = blank, blank4 = blank) |> 
+  arrange(chr, as.numeric(start)) |> 
+  distinct()
+write_tsv(vepInputdiagnosticVars, paste0(path, "sperm/germanTrio_data/postNextflow/vep/diagnosticVars.vcf"), col_names = F) 
+
+# Trio DNMs
+vepInputTrioDNMs <- read_tsv(paste0(path, "sperm/germanTrio_data/dnmData/trioDNMs.tsv"), col_types = cols(), col_names = c("chr","start","blank","ref","alt", "PD_ID")) |> 
+  filter(PD_ID != "PD67073b") |> # Accidentally sent sister's blood and not index
+  filter(PD_ID != "PD64157a") |> # Removed for QC
+  # ID useful for joining indels back up
+  mutate(id = paste(chr,start,ref,alt, sep = "_")) |> 
+  select(chr, start, id, ref, alt, blank2 = blank, blank3 = blank, blank4 = blank) |> 
+  arrange(chr, as.numeric(start)) |> 
+  distinct()
+write_tsv(vepInputTrioDNMs, paste0(path, "sperm/germanTrio_data/postNextflow/vep/trioDNM_Vars.vcf"), col_names = F) 
+
+# MosaicVars
+vepInputMosaicVars <- read_tsv(paste0(localPath, "externalData/mosaicVars0.tsv"), col_types = cols()) |> 
+  mutate(blank = ".") |> 
+  # ID useful for joining indels back up
+  mutate(id = paste(chr,start,ref,alt, sep = "_")) |> 
+  select(chr, start, id, ref, alt, blank2 = blank, blank3 = blank, blank4 = blank) |> 
+  arrange(chr, as.numeric(start)) |> 
+  distinct()
+write_tsv(vepInputMosaicVars, paste0(path, "sperm/germanTrio_data/postNextflow/vep/MosaicVars_Vars.vcf"), col_names = F) 
+
+```
+
+#### Script
+```{bash maf, eval=FALSE}
+
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/vep
+module load conda/24.9.2
+conda activate <hpc_software>/conda_envs/envs/py3.6
+OUTPATH="<hpc_scratch>/sperm/germanTrio_data/postNextflow/vep"
+export PATH="<hpc_software>/ensembl-vep//htslib:/software/jdk-11.0.2/bin/:$PATH"
+export PERL5LIB="<hpc_software>/ensembl-vep/:<hpc_home>/perl5/lib/perl5:<hpc_home>/perl5/lib/perl5/site_perl:<hpc_software>/000_SOFTWARE/lib/perl5:$PERL5LIB"
+
+rm $OUTPATH/out*_vep.*
+ls *Vars.vcf | while read SAMPLE ; do echo "<hpc_software>/ensembl-vep/vep -i $SAMPLE -o $OUTPATH/out_$SAMPLE.tsv --tab \
+--dir <hpc_software>/000_SOFTWARE/vep/ --species homo_sapiens --cache --offline --force --refseq --no_stats --fork 4 --assembly GRCh37 \
+--fasta <hpc_software>/000_SOFTWARE/vep/homo_sapiens/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa \
+--symbol --af_gnomad --pick --show_ref_allele \
+--custom <hpc_shared>/External_databases/Variants/ClinVar/GRCh37/clinvar_20250729.vcf.gz,ClinVar,vcf,exact,0,CLNDN,CLNSIG,CLNSIGCONF \
+--custom <hpc_scratch>/genomicRegions/methylation/testisMeth19.bed.gz,methylation,bed,exact,0 \
+--custom ../cov1/triNucUniq.bed.gz,trinuc,bed,exact,0 \
+--custom <hpc_scratch>/sperm/germanTrio_data/postNextflow/vep/cadd0.vcf.gz,CADD,vcf,exact,0,CADD" | bsub -e <hpc_scratch>/sperm/germanTrio_data/postNextflow/vep/out.${SAMPLE%.vcf}_vep.err -o <hpc_scratch>/sperm/germanTrio_data/postNextflow/vep/out.${SAMPLE%.vcf}_vep.out -J ${SAMPLE%.vcf}_vep -n4 -q normal -R 'select[mem>=2000] rusage[mem=2000] span[hosts=1]' -M2000  -env "all" ; done 
+
+```
+
+#### Script trios for Joe
+```{bash maf, eval=FALSE}
+
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/vep
+module load conda/24.9.2
+conda activate <hpc_software>/conda_envs/envs/py3.6
+OUTPATH="<hpc_scratch>/sperm/germanTrio_data/postNextflow/vep"
+export PATH="<hpc_software>/ensembl-vep//htslib:/software/jdk-11.0.2/bin/:$PATH"
+export PERL5LIB="<hpc_software>/ensembl-vep/:<hpc_home>/perl5/lib/perl5:<hpc_home>/perl5/lib/perl5/site_perl:<hpc_software>/000_SOFTWARE/lib/perl5:$PERL5LIB"
+
+rm $OUTPATH/out*_vep.clinAnnot.*
+ls trioDNM_Vars.vcf | while read SAMPLE ; do echo "<hpc_software>/ensembl-vep/vep \
+  -i $SAMPLE \
+  -o $OUTPATH/out_$SAMPLE.clinAnnot.tsv \
+  --tab \
+  --dir <hpc_software>/000_SOFTWARE/vep/ \
+  --species homo_sapiens \
+  --cache --offline --force --refseq --no_stats --fork 4 \
+  --assembly GRCh37 \
+  --fasta <hpc_software>/000_SOFTWARE/vep/homo_sapiens/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa \
+  --symbol --af_gnomad --pick --show_ref_allele \
+  --check_existing \
+  --sift b --polyphen b \
+  --hgvs \
+  --plugin Phenotypes \
+  --fields 'Uploaded_variation,Location,Allele,REF_ALLELE,Gene,SYMBOL,Feature,Feature_type,Consequence,IMPACT,EXON,INTRON,\
+HGVSc,HGVSp,SIFT,PolyPhen,Existing_variation,VARIANT_CLASS,gnomADe_AF,gnomADg_AF,\
+ClinVar_CLNDN,ClinVar_CLNSIG,ClinVar_CLNSIGCONF,\
+methylation,trinuc,CADD_CADD,Phenotypes' \
+  --custom <hpc_shared>/External_databases/Variants/ClinVar/GRCh37/clinvar_20250729.vcf.gz,ClinVar,vcf,exact,0,CLNDN,CLNSIG,CLNSIGCONF \
+  --custom <hpc_scratch>/genomicRegions/methylation/testisMeth19.bed.gz,methylation,bed,exact,0 \
+  --custom ../cov1/triNucUniq.bed.gz,trinuc,bed,exact,0 \
+  --custom <hpc_scratch>/sperm/germanTrio_data/postNextflow/vep/cadd0.vcf.gz,CADD,vcf,exact,0,CADD" | bsub -e <hpc_scratch>/sperm/germanTrio_data/postNextflow/vep/out.${SAMPLE%.vcf}_vep.clinAnnot.err -o <hpc_scratch>/sperm/germanTrio_data/postNextflow/vep/out.${SAMPLE%.vcf}_vep.clinAnnot.out -J ${SAMPLE%.vcf}_vep -n4 -q normal -R 'select[mem>=2000] rusage[mem=2000] span[hosts=1]' -M2000  -env "all" ; done 
+
+```
+
+#### Annot objects
+```{r annotObjects}
+# DDD monoallelic lof genes from 2025
+dddLOF <- read_csv("<local_working_dir>/G2P_DD_2025-09-17.csv", col_types = cols()) |> 
+  dplyr::rename(gene = `gene symbol`)|> 
+  filter(`allelic requirement` != "biallelic_autosomal" & `confidence` %in% c("strong","definitive")) |> 
+  filter(`molecular mechanism` == "loss of function") |> distinct(gene) |> pull(gene)
+write_tsv(tibble(gene = dddLOF), paste0(localPath, "data/dddLOF.txt"))
+# Likely drivers is combo of TwinsUK genes & hotspots + those identified in this project
+lofGenesGermanTrio <- read_tsv(paste0(localPath, "data/sigGenes.tsv"), col_types = cols()) |> 
+    mutate(germlineMechanism = if_else((ptrunc_cv < 0.1 | pind_cv < 0.1) & ((n_non + n_spl + n_ind) > 1) | gene_name == "PUF60", "LOF", "-")) |> 
+  filter(germlineMechanism == "LOF") |> pull(gene_name) 
+lofGenesGermanTUK <- bind_rows(read_csv(paste0(TUKpath, "data/simpleAnnotGenes.csv"), col_types = cols())) |> 
+  filter(germlineMechanism == "LOF") |> filter(testSig == "Exome-wide") |> 
+ pull(gene) 
+lofSelectionGenes <- unique(c(lofGenesGermanTrio, lofGenesGermanTUK))
+write_tsv(tibble(gene = lofSelectionGenes), paste0(localPath, "data/lofSelectionGenesShare.tsv"))
+
+hotspots0 <- read_tsv(paste0(localPath, "data/siteHotspots_dndsBP_sig.tsv"), col_types = cols()) |> 
+  bind_rows(read_tsv(paste0(TUKpath, "data/siteHotspots_dnds_sig.tsv"),col_types = cols())) 
+
+hotspots <- hotspots0 |> 
+  mutate(var = paste(chr,pos,ref,mut, sep = "_")) |> 
+  distinct(var)
+write_tsv(hotspots0 |> select(chr:impact)|> distinct(gene), paste0(localPath, "data/hotspotsSelectionShare.tsv"))
+
+allSelectionGenes <- unique(c(hotspots0$gene, lofSelectionGenes))
+write_tsv(tibble(gene = allSelectionGenes), paste0(localPath, "data/allSelectionGenesTUK_DDfathers.txt"))
+```
+
+#### Process Variants
+```{r processVEP}
+vepOutput <- read_tsv(paste0(path, "sperm/germanTrio_data/postNextflow/vep/out_allCallsFilterVars.vcf.tsv"), col_types = cols(), comment = "##") |> 
+  select(id = `#Uploaded_variation`, csq = Consequence, IMPACT, gene = SYMBOL, gnomADe_AF, PHEN = ClinVar_CLNDN, CLNSIG = ClinVar_CLNSIG, CLNSIGCONF = ClinVar_CLNSIGCONF, cadd = CADD_CADD, trinuc, meth = methylation) |> 
+  distinct()
+
+allCallsFilterVarsVEP <- read_tsv(paste0(localPath, "data/allCallsFilterVars.tsv"), col_types = cols()) |> 
+  left_join(vepInputTjoint |> select(chr:alt) |> distinct() |> 
+              left_join(vepOutput, by = join_by(id)) |> select(-id), by = join_by(chr, start, ref, alt)) |> 
+  mutate(csq = str_remove(csq, ",.*")) |> 
+  mutate(csq = str_remove(csq, "_variant")) |> 
+  mutate(csqSimple = if_else(csq %in% c("3_prime_UTR", "5_prime_UTR", "downstream_gene", "intergenic", "intron", "non_coding_transcript_exon", "splice_region", "upstream_gene"), "non-coding", csq)) |> 
+  mutate(csqSimple = if_else(csq %in% c("stop_gained", "splice_acceptor", "splice_donor"), "nonsense+splice", csqSimple)) |> 
+  mutate(csqSimple = if_else(csq %in% c("frameshift", "inframe_deletion", "inframe_insertion"), "coding-indel", csqSimple)) |> 
+  mutate(cadd = as.numeric(na_if(cadd, "-"))) |> mutate(gnomADe_AF = as.numeric(na_if(gnomADe_AF, "-"))) |>
+  # Criteria for labeling variants as ClinVar path or not:
+  mutate(ClinVar = if_else(CLNSIG %in% c("Pathogenic/Likely_pathogenic", "Pathogenic", "Likely_pathogenic") | 
+                             CLNSIG == "Conflicting_classifications_of_pathogenicity" & 
+                              ((str_detect(CLNSIGCONF, "Pathogenic") | str_detect(CLNSIGCONF, "Likely_pathogenic")) & !str_detect(CLNSIGCONF, "enign")
+                                 ), T, F)) |> 
+  # Annotate likely disease/driver variants
+  mutate(likelyDisease = if_else(ClinVar | (gene %in% dddLOF & IMPACT == "HIGH") |
+         (gene %in% dddLOF & coalesce(cadd, -Inf) >= 30 & gnomADe_AF < 5e-6), TRUE, FALSE)) |> 
+  mutate(var = paste(chr,start,ref,alt, sep = "_")) |> 
+  mutate(likelyDriver = if_else((gene %in% lofSelectionGenes & (IMPACT == "HIGH" | coalesce(cadd, -Inf) >= 30)) |
+         (var %in% hotspots$var), TRUE, FALSE)) |> 
+  # Group meth
+  mutate(meth = str_remove(meth, ",.*")) |>
+  mutate(meth = as.numeric(str_replace(meth, "-", "-1"))) |>
+  mutate(isCpGtoT = if_else((substr(TRI,2,5) == "CG>T" & alt == "T" & ref == "C") | (substr(TRI,2,5) == "CG>T" & alt == "A" & ref == "G"), T,F)) |>
+  mutate(methBin = if_else(isCpGtoT & meth > 40, "High", "Mid")) |> mutate(methBin = if_else(isCpGtoT & meth >= 0 & meth <=10, "Low", methBin)) |>
+  mutate(meth = if_else(isCpGtoT, meth, 0)) |>
+  select(-c(QPOS,  isCpGtoT, var)) |> 
+  distinct()
+
+
+filterVarsVEP <- allCallsFilterVarsVEP |> 
+  filter(FILTER == "PASS" & sampleFilter == "FULL") |> select(-FILTER, sampleFilter)
+
+write_tsv(allCallsFilterVarsVEP, paste0(localPath, "data/allCallsFilterVarsVEP.tsv"))
+write_tsv(allCallsFilterVarsVEP |> filter(sampleFilter == "FULL"), paste0(localPath, "data/germanTrioAllTargVars.tsv"))
+write_tsv(filterVarsVEP, paste0(localPath, "data/germanTrioTargVars.tsv"))
+
+diagVarsVEP <- allCallsFilterVarsVEP |> 
+  filter(FILTER == "diagVar") |> select(-FILTER, sampleFilter)
+write_tsv(diagVarsVEP, paste0(localPath, "data/diagVarsVEP.tsv"))
+
+# Take a look at excluded variants - any of interest?
+excluded <- allCallsFilterVarsVEP |> filter(!FILTER %in% c("PASS", "diagVar")) |> filter(likelyDisease|likelyDriver)
+
+```
+
+#### Process Discarded
+```{r processVEP}
+# vepOutputDiscarded <- read_tsv(paste0(path, "sperm/germanTrio_data/postNextflow/vep/out_discardedCallsVars.vcf.tsv"), col_types = cols(), comment = "##") |> 
+#   select(id = `#Uploaded_variation`, csq = Consequence, IMPACT, gene = SYMBOL, gnomADe_AF, PHEN = ClinVar_CLNDN, CLNSIG = ClinVar_CLNSIG, CLNSIGCONF = ClinVar_CLNSIGCONF, cadd = CADD_CADD, trinuc, meth = methylation) |> 
+#   distinct()
+# 
+# discardedVarsVEP <- read_tsv(paste0(path, "sperm/germanTrio_data/canAppsOutput/discardedCalls.vcf"), col_names = c("chr", "start", "ref", "alt", "FILTER","info", "Sample_PD_ID"), col_types = 'cd-cc-ccc') |> 
+#   left_join(discardedVepInput |> select(chr:alt) |> distinct() |> 
+#               left_join(vepOutputDiscarded, by = join_by(id)) |> select(-id), by = join_by(chr, start, ref, alt)) |> 
+#   mutate(csq = str_remove(csq, ",.*")) |> 
+#   mutate(csq = str_remove(csq, "_variant")) |> 
+#   mutate(csqSimple = if_else(csq %in% c("3_prime_UTR", "5_prime_UTR", "downstream_gene", "intergenic", "intron", "non_coding_transcript_exon", "splice_region", "upstream_gene"), "non-coding", csq)) |> 
+#   mutate(csqSimple = if_else(csq %in% c("stop_gained", "splice_acceptor", "splice_donor"), "nonsense+splice", csqSimple)) |> 
+#   mutate(csqSimple = if_else(csq %in% c("frameshift", "inframe_deletion", "inframe_insertion"), "coding-indel", csqSimple)) |> 
+#   mutate(cadd = as.numeric(na_if(cadd, "-"))) |> mutate(gnomADe_AF = as.numeric(na_if(gnomADe_AF, "-"))) |>
+#   # Criteria for labeling variants as ClinVar path or not:
+#   mutate(ClinVar = if_else(CLNSIG %in% c("Pathogenic/Likely_pathogenic", "Pathogenic", "Likely_pathogenic") | 
+#                              CLNSIG == "Conflicting_classifications_of_pathogenicity" & 
+#                               ((str_detect(CLNSIGCONF, "Pathogenic") | str_detect(CLNSIGCONF, "Likely_pathogenic")) & !str_detect(CLNSIGCONF, "enign")
+#                                  ), T, F)) |> 
+#   # Annotate likely disease/driver variants
+#   mutate(likelyDisease = if_else(ClinVar | (gene %in% dddLOF & IMPACT == "HIGH") |
+#          (gene %in% dddLOF & coalesce(cadd, -Inf) >= 30 & gnomADe_AF < 5e-6), TRUE, FALSE)) |> 
+#   mutate(var = paste(chr,start,ref,alt, sep = "_")) |> 
+#   mutate(likelyDriver = if_else((gene %in% lofSelectionGenes & (IMPACT == "HIGH" | coalesce(cadd, -Inf) >= 30)) |
+#          (var %in% hotspots$var), TRUE, FALSE)) |> 
+#   # Group meth
+#   mutate(meth = str_remove(meth, ",.*")) |>
+#   mutate(meth = as.numeric(str_replace(meth, "-", "-1"))) |>
+#   distinct()
+# 
+# write_tsv(discardedVarsVEP, paste0(localPath, "data/discardedVarsVEP.tsv"))
+```
+
+#### Process Diagnostic
+```{r processVEP}
+# Annotation run in #### Process Variants step later on then read back in
+vepOutputDiag <- read_tsv(paste0(path, "sperm/germanTrio_data/postNextflow/vep/out_diagnosticVars.vcf.tsv"), col_types = cols(), comment = "##") |> 
+  select(id = `#Uploaded_variation`, csq = Consequence, IMPACT, gene = SYMBOL, gnomADe_AF, PHEN = ClinVar_CLNDN, CLNSIG = ClinVar_CLNSIG, CLNSIGCONF = ClinVar_CLNSIGCONF, cadd = CADD_CADD) |> mutate(cadd = as.numeric(cadd)) |> 
+  distinct()
+
+diagnosticVars <- diagnosticVarsPos |> rename(gene0 = gene) |> 
+  left_join(vepInputdiagnosticVars |> select(chr:alt) |> distinct() |> 
+              left_join(vepOutputDiag, by = join_by(id)) |> select(-id), by = join_by(chr, start, ref, alt)) |> 
+  mutate(csq = str_remove(csq, ",.*")) |> 
+  mutate(csq = str_remove(csq, "_variant")) |> 
+  mutate(gnomADe_AF = as.numeric(na_if(gnomADe_AF, "-"))) |>
+    # Criteria for labeling variants as ClinVar path or not:
+  mutate(ClinVar = if_else(CLNSIG %in% c("Pathogenic/Likely_pathogenic", "Pathogenic", "Likely_pathogenic") | 
+                             CLNSIG == "Conflicting_classifications_of_pathogenicity" & 
+                              ((str_detect(CLNSIGCONF, "Pathogenic") | str_detect(CLNSIGCONF, "Likely_pathogenic")) & !str_detect(CLNSIGCONF, "enign")
+                                 ), T, F)) |> 
+  # Annotate likely disease/driver variants
+  mutate(likelyDisease = if_else(ClinVar | (gene %in% dddLOF & IMPACT == "HIGH") |
+         (gene %in% dddLOF & coalesce(cadd, -Inf) >= 30 & gnomADe_AF < 5e-6), TRUE, FALSE)) |> 
+  mutate(var = paste(chr,start,ref,alt, sep = "_")) |> 
+  mutate(likelyDriver = if_else((gene %in% lofSelectionGenes & (IMPACT == "HIGH" | coalesce(cadd, -Inf) >= 30)) |
+         (var %in% hotspots$var) | start == 	
+123279674, TRUE, FALSE)) |> 
+  select(-c( missing_TrioWGS, var)) |> 
+  arrange(VAR_ID) |> 
+  left_join(trioBurdens |> select(FAM_ID, PD_ID) |> distinct() )|> mutate(gnomADe_AF = as.character(gnomADe_AF))|> mutate(cadd = as.character(cadd))
+
+# KIAA2022 annotated as gene name for 2 vars by VEP but current approved name is NEXMIF as annotated in original file
+write_tsv(diagnosticVars, paste0(metaPath, "germanTrio_diagnosticVars.tsv"))
+```
+
+#### Process trioDNMs
+```{r processVEP}
+# Annotation run in #### Process Variants step later on then read back in
+vepOutputTrio <- read_tsv(paste0(path, "sperm/germanTrio_data/postNextflow/vep/out_trioDNM_Vars.vcf.tsv"), col_types = cols(), comment = "##") |> 
+  select(id = `#Uploaded_variation`, csq = Consequence, IMPACT, gene = SYMBOL, gnomADe_AF, PHEN = ClinVar_CLNDN, CLNSIG = ClinVar_CLNSIG, CLNSIGCONF = ClinVar_CLNSIGCONF, cadd = CADD_CADD) |> 
+  distinct() |> 
+  mutate(diagnosticVar = if_else(id %in% vepInputdiagnosticVars$id, T, F))
+
+trioDNM_Vars <- read_tsv(paste0(path, "sperm/germanTrio_data/dnmData/trioDNMs.tsv"), col_types = 'ci-cc------c', col_names = c("chr","start","ref","alt", "PD_ID")) |> 
+  left_join(SupTable3_Trios |> select(PD_ID = PD_ID_Proband, FAM_ID), by = join_by(PD_ID)) |> 
+    filter(PD_ID != "PD67073b") |> # Accidentally sent sister's blood and not index
+  filter(PD_ID != "PD64157a") |> # Removed for QC
+  left_join(vepInputTrioDNMs |> select(chr:alt) |> distinct() |> 
+              left_join(vepOutputTrio, by = join_by(id)) |> select(-id), by = join_by(chr, start, ref, alt)) |> 
+  mutate(csq = str_remove(csq, ",.*")) |> 
+  mutate(csq = str_remove(csq, "_variant")) |> 
+  mutate(csqSimple = if_else(csq %in% c("3_prime_UTR", "5_prime_UTR", "downstream_gene", "intergenic", "intron", "non_coding_transcript_exon", "splice_region", "upstream_gene"), "non-coding", csq)) |> 
+  mutate(csqSimple = if_else(csq %in% c("stop_gained", "splice_acceptor", "splice_donor"), "nonsense+splice", csqSimple)) |> 
+  mutate(csqSimple = if_else(csq %in% c("frameshift", "inframe_deletion", "inframe_insertion"), "coding-indel", csqSimple)) |> 
+  mutate(cadd = as.numeric(na_if(cadd, "-"))) |> mutate(gnomADe_AF = as.numeric(na_if(gnomADe_AF, "-"))) |>
+  # Criteria for labeling variants as ClinVar path or not:
+  mutate(ClinVar = if_else(CLNSIG %in% c("Pathogenic/Likely_pathogenic", "Pathogenic", "Likely_pathogenic")| 
+                             CLNSIG == "Conflicting_classifications_of_pathogenicity" & 
+                              ((str_detect(CLNSIGCONF, "Pathogenic") | str_detect(CLNSIGCONF, "Likely_pathogenic")) & !str_detect(CLNSIGCONF, "enign")
+                                 ), T, F)) |> 
+    # Annotate likely disease/driver variants
+  mutate(likelyDisease = if_else(ClinVar | (gene %in% dddLOF & IMPACT == "HIGH") |
+         (gene %in% dddLOF & coalesce(cadd, -Inf) >= 30 & (is.na(gnomADe_AF) | gnomADe_AF < 5e-6)),
+TRUE, FALSE)) |>
+  mutate(var = paste(chr,start,ref,alt, sep = "_")) |> 
+  mutate(likelyDriver = if_else((gene %in% lofSelectionGenes & (IMPACT == "HIGH" | coalesce(cadd, -Inf) >= 30)) |
+         (var %in% hotspots$var), TRUE, FALSE)) |> 
+  select(-c(var, ClinVar)) |> 
+  mutate(Cohort = "DD fathers") |> 
+  distinct() |> 
+  #Add VAFs
+  left_join(read_tsv(paste0(path, "sperm/germanTrio_data/dnmData/merged_denovo_mutationsVAFs.txt"), col_types = cols()), by = join_by(chr, start, ref, alt, PD_ID)) |> 
+  filter(VAF >= 0.3) |> select(-VAF)
+
+
+write_tsv(trioDNM_Vars, paste0(metaPath, "trioDNM_Vars.tsv"))
+```
+
+##### Process trioDNMs Clinical
+```{r processVEP}
+# Annotation run in #### Process Variants step later on then read back in
+vepOutputTrioClin <- read_tsv(paste0(path, "sperm/germanTrio_data/postNextflow/vep/out_trioDNM_Vars.vcf.clinAnnot.tsv"), col_types = cols(), comment = "##") |> 
+  mutate( HGVSp_Short = str_remove(HGVSp, "^[^:]+:")) |> 
+  mutate(HGVSp_Short = str_replace_all(HGVSp_Short,
+    c("Ala"="A","Arg"="R","Asn"="N","Asp"="D","Cys"="C","Gln"="Q","Glu"="E",
+      "Gly"="G","His"="H","Ile"="I","Leu"="L","Lys"="K","Met"="M","Phe"="F",
+      "Pro"="P","Ser"="S","Thr"="T","Trp"="W","Tyr"="Y","Val"="V","Ter"="*"))) |> 
+  select(id = `#Uploaded_variation`, csq = Consequence, IMPACT, HGVSc, HGVSp, HGVSp_Short, gene = SYMBOL, gnomADe_AF, Existing_variation, PHEN = ClinVar_CLNDN, CLNSIG = ClinVar_CLNSIG, CLNSIGCONF = ClinVar_CLNSIGCONF, cadd = CADD_CADD, SIFT, PolyPhen, REF_ALLELE, Allele) |> 
+  distinct() |> 
+  mutate(diagnosticVar = if_else(id %in% vepInputdiagnosticVars$id, T, F))
+
+trioDNM_VarsClin <- read_tsv(paste0(path, "sperm/germanTrio_data/dnmData/trioDNMs.tsv"), col_types = 'ci-cc------c', col_names = c("chr","start","ref","alt", "PD_ID")) |> 
+    filter(PD_ID != "PD67073b") |> # Accidentally sent sister's blood and not index
+  filter(PD_ID != "PD64157a") |> # Removed for QC
+  left_join(vepInputTrioDNMs |> select(chr:alt) |> distinct() |> 
+              left_join(vepOutputTrioClin, by = join_by(id)) |> select(-id), by = join_by(chr, start, ref, alt)) |> 
+  mutate(csq = str_remove(csq, ",.*")) |> 
+  mutate(csq = str_remove(csq, "_variant")) |> 
+  mutate(csqSimple = if_else(csq %in% c("3_prime_UTR", "5_prime_UTR", "downstream_gene", "intergenic", "intron", "non_coding_transcript_exon", "splice_region", "upstream_gene"), "non-coding", csq)) |> 
+  mutate(csqSimple = if_else(csq %in% c("stop_gained", "splice_acceptor", "splice_donor"), "nonsense+splice", csqSimple)) |> 
+  mutate(csqSimple = if_else(csq %in% c("frameshift", "inframe_deletion", "inframe_insertion"), "coding-indel", csqSimple)) |> 
+  filter(IMPACT %in% c("HIGH", "MODERATE") | diagnosticVar)
+
+write_tsv(trioDNM_VarsClin, paste0(metaPath, "trioDNM_VarsClin.tsv"))
+
+forClinicalAnnot <- trioDNM_VarsClin |> 
+  left_join(read_csv(paste0(metaPath, "Tables/JoeClinicalReview2.0.csv"), col_types = cols()) |> select(chr = Chromosome, start = Start_Position, REF_ALLELE = Reference_Allele, Allele = ALT, Group:Comments), by = join_by(chr, start, REF_ALLELE, Allele)) |> 
+  mutate(Group = if_else(diagnosticVar, "Diagnostic variant", Group)) |> 
+  select(Group:Comments, chr:PolyPhen) |> 
+  bind_rows(diagnosticVars |> filter(FAM_ID %in% trioBurdens$FAM_ID) |> filter((FAM_ID %in% (diagnosticVarsPos |> filter(called_TrioWGS == "No") |> pull(FAM_ID)))) |> mutate(Group = "Diagnostic variant (Uncalled)") |> select(-c(FAM_ID, VAR_ID, Cohort, gene0, called_TrioWGS, phasing, ClinVar, likelyDisease, likelyDriver))) |> 
+  arrange(Group)
+
+
+table(forClinicalAnnot$Group)
+
+write_csv(forClinicalAnnot, paste0(metaPath, "forClinicalAnnotJoeC_3.1.csv"))
+```
+
+#### Process mosaicVars
+```{r processVEP}
+# Annotation run in #### Process Variants step later on then read back in
+vepOutputMosaicVars <- read_tsv(paste0(path, "sperm/germanTrio_data/postNextflow/vep/out_MosaicVars_Vars.vcf.tsv"), col_types = cols(), comment = "##") |> 
+  select(id = `#Uploaded_variation`, csq = Consequence, IMPACT, gene = SYMBOL, gnomADe_AF, PHEN = ClinVar_CLNDN, CLNSIG = ClinVar_CLNSIG, CLNSIGCONF = ClinVar_CLNSIGCONF, cadd = CADD_CADD) |> 
+  distinct()
+
+mosaicVarsAnnot <- read_tsv(paste0(localPath, "externalData/mosaicVars0.tsv"), col_types = cols()) |> 
+  left_join(vepInputMosaicVars |> select(chr:alt) |> distinct() |> 
+              left_join(vepOutputMosaicVars, by = join_by(id)) |> select(-id), by = join_by(chr, start, ref, alt)) |> 
+  mutate(csq = str_remove(csq, ",.*")) |> 
+  mutate(csq = str_remove(csq, "_variant")) |> 
+  mutate(csqSimple = if_else(csq %in% c("3_prime_UTR", "5_prime_UTR", "downstream_gene", "intergenic", "intron", "non_coding_transcript_exon", "splice_region", "upstream_gene"), "non-coding", csq)) |> 
+  mutate(csqSimple = if_else(csq %in% c("stop_gained", "splice_acceptor", "splice_donor"), "nonsense+splice", csqSimple)) |> 
+  mutate(csqSimple = if_else(csq %in% c("frameshift", "inframe_deletion", "inframe_insertion"), "coding-indel", csqSimple)) |> 
+  mutate(cadd = as.numeric(na_if(cadd, "-"))) |> mutate(gnomADe_AF = as.numeric(na_if(gnomADe_AF, "-"))) |>
+  # Criteria for labeling variants as ClinVar path or not:
+  mutate(ClinVar = if_else(CLNSIG %in% c("Pathogenic/Likely_pathogenic", "Pathogenic", "Likely_pathogenic") | 
+                             CLNSIG == "Conflicting_classifications_of_pathogenicity" & 
+                              ((str_detect(CLNSIGCONF, "Pathogenic") | str_detect(CLNSIGCONF, "Likely_pathogenic")) & !str_detect(CLNSIGCONF, "enign")
+                                 ), T, F)) |> 
+    # Annotate likely disease/driver variants
+  mutate(likelyDisease = if_else(ClinVar | (gene %in% dddLOF & IMPACT == "HIGH") |
+         (gene %in% dddLOF & coalesce(cadd, -Inf) >= 30 & gnomADe_AF < 5e-6), TRUE, FALSE)) |> 
+  mutate(var = paste(chr,start,ref,alt, sep = "_")) |> 
+  mutate(likelyDriver = if_else((gene %in% lofSelectionGenes & (IMPACT == "HIGH" | coalesce(cadd, -Inf) >= 30)) |
+         (var %in% hotspots$var), TRUE, FALSE)) |> 
+  distinct()
+
+write_tsv(mosaicVarsAnnot, paste0(localPath, "externalData/mosaicVarsAnnot.tsv"))
+
+```
+
+### Run Covered
+#### Coverage in cohort
+```{bash covFull, eval=FALSE}
+#Make summary files with coverage for all indivs at all positions
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/cov
+nano getTotalCov.sh
+
+#!/bin/bash
+
+# Set working directory
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/cov/targCut
+
+# Load bedtools
+module load bedtools2-2.29.0/
+
+# Full path to the filtered sample list
+SAMPLE_LIST=../../../germanTrioSamplesFiltered.txt
+
+### -----------------------------
+### PART 1: PD6-only sample set
+### -----------------------------
+
+# Get PD6 IDs only (column 1)
+PD6_IDS=$(cut -f1 "$SAMPLE_LIST" | grep "^PD6")
+
+# Generate file names and names for bedtools
+files_PD6=$(echo "$PD6_IDS" | awk '{print $0 ".cov.bed"}' | tr '\n' ' ')
+names_PD6=$(echo "$PD6_IDS" | tr '\n' ' ')
+
+# Run unionbedg for PD6 samples
+bedtools unionbedg -i $files_PD6 -header -names $names_PD6 > ../summaryCov.bed
+
+# Sum coverage and output
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/cov/
+awk 'OFS="\t" {sum=0; for (col=4; col<=NF; col++) sum += $col; print $1, $2, $3, sum;}' summaryCov.bed | tail -n +2 > totalCov.bed
+bgzip -c totalCov.bed > totalCov.bed.gz
+tabix -p bed totalCov.bed.gz
+
+bedtools merge -i totalCov.bed > totalCovMerged.bed
+
+# Return to bed directory for second run
+cd targCut
+
+### -----------------------------
+### PART 2: All samples (Ox version)
+### -----------------------------
+
+# Get all IDs (column 1)
+ALL_IDS=$(cut -f1 "$SAMPLE_LIST")
+
+# Generate file names and names for bedtools
+files_all=$(echo "$ALL_IDS" | awk '{print $0 ".cov.bed"}' | tr '\n' ' ')
+names_all=$(echo "$ALL_IDS" | tr '\n' ' ')
+
+# Run unionbedg for all samples
+bedtools unionbedg -i $files_all -header -names $names_all > ../summaryCovOx.bed
+
+# Sum coverage and output
+cd ..
+awk 'OFS="\t" {sum=0; for (col=4; col<=NF; col++) sum += $col; print $1, $2, $3, sum;}' summaryCovOx.bed | tail -n +2 > totalCovOx.bed
+bgzip -c totalCovOx.bed > totalCovOx.bed.gz
+tabix -p bed totalCovOx.bed.gz
+
+
+
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/cov
+bsub -q long -o jobLogs/sumCov.%J.out -e jobLogs/sumCov.%J.err -R 'select[mem>=10000] rusage[mem=10000] span[hosts=1]' -M 10000 ./getTotalCov.sh
+
+```
+
+#### Full Covered vcf
+```{bash CADDcov, eval=FALSE}
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/vep
+nano getOpps.sh
+
+#!/bin/bash
+set -euo pipefail
+# Function to generate VCF from a trinucleotide input file
+generate_vcf() {
+    local infile=$1
+    local outfile=$2
+
+    exec 3> "$outfile"
+
+    while read -r chr pos tri; do
+        ref="${tri:1:1}"
+        for alt in A C G T; do
+            if [ "$alt" != "$ref" ]; then
+                echo -e "$chr\t$pos\t.\t$ref\t$alt\t.\t.\t." >&3
+            fi
+        done
+    done < "$infile"
+
+    exec 3>&-
+
+    bgzip -f "$outfile"
+    tabix -f "$outfile.gz"
+}
+
+# Run for PD6-only set
+generate_vcf ../cov/triNucUniq.txt coveredOpps.vcf
+# Run for full Ox set
+generate_vcf ../cov/triNucUniqOx.txt coveredOppsOx.vcf
+
+
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/vep
+bsub -o jobLogs/getOpps.out -e jobLogs/getOpps.err -q normal -R 'select[mem>=100] rusage[mem=100] span[hosts=1]' -M100 ./getOpps.sh
+
+
+
+```
+
+#### Running VEP on all covered base pairs to be able to generate background expectations of mutation burden
+```{bash maf, eval=FALSE}
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/vep
+mkdir -p  splitChrVEP
+module load conda/24.9.2
+conda activate <hpc_software>/conda_envs/envs/py3.6
+OUTPATH="<hpc_scratch>/sperm/germanTrio_data/postNextflow/vep"
+export PATH="<hpc_software>/ensembl-vep//htslib:/software/jdk-11.0.2/bin/:$PATH"
+export PERL5LIB="<hpc_software>/ensembl-vep/:<hpc_home>/perl5/lib/perl5:<hpc_home>/perl5/lib/perl5/site_perl:<hpc_software>/000_SOFTWARE/lib/perl5:$PERL5LIB"
+
+#!/bin/bash
+CHRs=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 X Y)
+
+for chr in ${CHRs[@]}
+do
+echo "tabix -h coveredOpps.vcf.gz ${chr} | <hpc_software>/ensembl-vep/vep --format vcf -o splitChrVEP/coveredVEP_${chr}.tsv --tab \
+--dir <hpc_software>/000_SOFTWARE/vep/ --species homo_sapiens --cache --offline --force --refseq --no_stats --fork 4 --assembly GRCh37 \
+--fasta <hpc_software>/000_SOFTWARE/vep/homo_sapiens/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa \
+--symbol --af_gnomad --pick --show_ref_allele \
+--custom <hpc_shared>/External_databases/Variants/ClinVar/GRCh37/clinvar_20250729.vcf.gz,ClinVar,vcf,exact,0,CLNDN,CLNSIG,CLNSIGCONF \
+--custom ../cov/totalCov.bed.gz,totalCov,bed,exact,0 \
+--custom ../cov/triNucUniq.bed.gz,trinuc,bed,exact,0 \
+--custom <hpc_scratch>/genomicRegions/methylation/testisMeth19.bed.gz,methylation,bed,exact,0 \
+--custom <hpc_scratch>/sperm/germanTrio_data/postNextflow/vep/cadd0.vcf.gz,CADD,vcf,exact,0,CADD" | bsub -e jobLogs/split.${chr}.vep.err -o jobLogs/split.${chr}.vep.out -J ${chr}_vep -n4 -q normal -R 'select[mem>=1000] rusage[mem=1000] span[hosts=1]' -M1000  -env "all"
+done
+
+for chr in ${CHRs[@]}
+do
+echo "tabix -h coveredOppsOx.vcf.gz ${chr} | <hpc_software>/ensembl-vep/vep --format vcf -o splitChrVEP/Ox/coveredVEP_Ox_${chr}.tsv --tab \
+--dir <hpc_software>/000_SOFTWARE/vep/ --species homo_sapiens --cache --offline --force --refseq --no_stats --fork 4 --assembly GRCh37 \
+--fasta <hpc_software>/000_SOFTWARE/vep/homo_sapiens/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa \
+--symbol --af_gnomad --pick --show_ref_allele \
+--custom <hpc_shared>/External_databases/Variants/ClinVar/GRCh37/clinvar_20250729.vcf.gz,ClinVar,vcf,exact,0,CLNDN,CLNSIG,CLNSIGCONF \
+--custom ../cov/totalCovOx.bed.gz,totalCov,bed,exact,0 \
+--custom ../cov/triNucUniqOx.bed.gz,trinuc,bed,exact,0 \
+--custom <hpc_scratch>/genomicRegions/methylation/testisMeth19.bed.gz,methylation,bed,exact,0 \
+--custom <hpc_scratch>/sperm/germanTrio_data/postNextflow/vep/cadd0.vcf.gz,CADD,vcf,exact,0,CADD" | bsub -e jobLogs/splitOx.${chr}.vep.err -o jobLogs/splitOx.${chr}.vep.out -J ${chr}_Oxvep -n4 -q normal -R 'select[mem>=1000] rusage[mem=1000] span[hosts=1]' -M1000  -env "all"
+done
+
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/vep
+rm jobLogs/split.*
+./vepCovered.sh
+```
+
+#### Merge and simplify
+```{bash maf, eval=FALSE}
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/vep
+nano preFilterVep.sh
+
+#!/bin/bash
+cat splitChrVEP/*.tsv | grep -v '#' | awk -F'\t' -v OFS='\t' '{split($2, arr, ":"); gsub(/,.*/, "", $7); gsub(/_variant/, "", $7); print arr[1], arr[2], $14, $3, $7, $15, $19, $28, $41, $42, $43, $44, $45, $48}' > vepCoveredProcessed.tsv
+# Get unique gene + type
+cut -f 1,2,6,7 vepCoveredProcessed.tsv | uniq > vepCoveredGeneImpact.tsv
+
+cat splitChrVEP/Ox/*.tsv | grep -v '#' | awk -F'\t' -v OFS='\t' '{split($2, arr, ":"); gsub(/,.*/, "", $7); gsub(/_variant/, "", $7); print arr[1], arr[2], $14, $3, $7, $15, $19, $28, $41, $42, $43, $44, $45, $48}' > vepCoveredProcessedOx.tsv
+# Get unique gene + type
+cut -f 1,2,6,7 vepCoveredProcessedOx.tsv | uniq > vepCoveredGeneImpactOx.tsv
+
+
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/vep
+bsub -e jobLogs/preFilter.vep.err -o jobLogs/preFilter.vep.out -J preFilter_vep -q normal -R 'select[mem>=1000] rusage[mem=1000] span[hosts=1]' -M1000 ./preFilterVep.sh
+
+```
+
+### Create regions
+#### Setup
+```{bash setup_regions, eval=FALSE}
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/cov/
+mkdir -p mutRegion/
+mkdir -p mutRegion/regions/
+mkdir -p mutRegion/muts/
+mkdir -p mutRegion/twinsUK/
+mkdir -p mutRegion/twinsUK/muts/
+```
+
+#### Write regions R
+```{r regions}
+# Coverage
+covRegions <- read_tsv(paste0(path, "sperm/germanTrio_data/postNextflow/vep/vepCoveredGeneImpact.tsv"), col_types = 'cicc', col_names = c("chr", "pos", "IMPACT", "gene")) |> 
+  mutate(bedStart = pos - 1)
+table(covRegions$IMPACT)
+table(covRegions$gene)
+
+sigGenesTUK <- read_tsv(paste0("<local_working_dir>/twinsUK_SpermPaperFiles/", "data/sigGenes.tsv"), col_types = cols()) 
+exclGenes <- c((sigGenesTUK |> pull(gene_name)), "ASXL1", "TET2", "SEMG1", "ANKRD11", "TSPYL2", "DNMT3A")
+
+
+write_tsv(covRegions |> filter(IMPACT == "MODIFIER") |> select(chr, bedStart, pos), 
+          file = paste0(path, "sperm/germanTrio_data/postNextflow/cov/mutRegion/regions/nonCoding.bed"), col_names = F)
+write_tsv(covRegions |> filter(IMPACT != "MODIFIER") |> select(chr, bedStart, pos), 
+          file = paste0(path, "sperm/germanTrio_data/postNextflow/cov/mutRegion/regions/coding.bed"), col_names = F)
+write_tsv(covRegions |> filter(!(gene %in% exclGenes & IMPACT != "MODIFIER")) |> select(chr, bedStart, pos), 
+          file = paste0(path, "sperm/germanTrio_data/postNextflow/cov/mutRegion/regions/exclDrivers.bed"), col_names = F)
+
+# Variants
+targVarsBed <- read_tsv(paste0(localPath, "data/germanTrioTargVars.tsv"), col_types = cols()) |> 
+  mutate(bedStart = start - 1) |> select(chr, bedStart, start)
+write_tsv(targVarsBed, file = paste0(path, "sperm/germanTrio_data/postNextflow/cov/mutRegion/muts/germanTrioTargVars.bed"), col_names = F)
+
+TUKtargVarsBed <- read_tsv(paste0("<local_working_dir>/twinsUK_SpermPaperFiles/", "data/analysisTargVars.tsv"), col_types = cols()) |> 
+  mutate(bedStart = start - 1) |> select(chr, bedStart, start)
+write_tsv(TUKtargVarsBed, file = paste0(path, "sperm/germanTrio_data/postNextflow/cov/mutRegion/twinsUK/muts/twinsUKtargVars.bed"), col_names = F)
+```
+
+#### Merge regions
+```{bash maf, eval=FALSE}
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/cov/mutRegion/regions/
+module load bedtools2-2.29.0/
+sort -k1,1 -k2,2n nonCoding.bed | bedtools merge > nonCoding.merged.bed
+sort -k1,1 -k2,2n coding.bed | bedtools merge > coding.merged.bed
+sort -k1,1 -k2,2n exclDrivers.bed | bedtools merge > exclDrivers.merged.bed
+
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/cov/mutRegion
+sort -k1,1 -k2,2n muts/germanTrioTargVars.bed > muts/germanTrioTargVars.sorted.bed
+sort -k1,1 -k2,2n twinsUK/muts/twinsUKtargVars.bed > twinsUK/muts/twinsUKtargVars.sorted.bed
+
+```
+
+
+#### Mut rate by region
+```{bash mutRegion, eval=FALSE}
+
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow
+rm cov/jobLogs/mutRegion*
+for sample in `cat ../germanTrioSamplesFiltered.txt | cut -f1`;
+  do echo $sample
+  for region in cov/mutRegion/regions/*.merged.bed
+    do 
+    # Remove directory path
+    filename=$(basename "$region")
+    # Remove file extension
+    basename="${filename%.merged.*}"
+    echo $basename
+    bsub -o cov/jobLogs/mutRegion.$sample.$basename.out -e cov/jobLogs/mutRegion.$sample.$basename.err -q normal -R 'select[mem>=200] rusage[mem=200] span[hosts=1]' -M 200 "module load bedtools2-2.29.0/; bedtools intersect -a cov/targCut/$sample.cov.bed -b cov/mutRegion/regions/$basename.merged.bed | cut -f 4 | paste -sd+ - | bc | sed 's/$/\t$sample\t$basename/'  >  cov/mutRegion/$sample.$basename.txt"
+  done
+done
+
+
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/cov/mutRegion/
+cat *.txt > mutRegionsCovs.tsv
+
+
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/cov/mutRegion/
+
+for region in regions/*.merged.bed
+  do 
+  # Remove directory path
+  filename=$(basename "$region")
+  # Remove file extension
+  basename="${filename%.merged.*}"
+  echo $basename
+  module load bedtools2-2.29.0/; bedtools intersect -a muts/germanTrioTargVars.sorted.bed -b regions/$basename.merged.bed | cut -f 1,3 | sed "s/$/\t$basename/" >  muts/$basename.txt
+done
+
+```
+
+##### Comp Mut rate by region TwinsUK exome samples
+```{bash mutRegion, eval=FALSE}
+
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow
+rm cov/jobLogs/mutRegionEx*
+for sample in `grep "exome" <hpc_scratch>/sperm/targeted/targetedSamplesFiltered.txt | cut -f1`;
+  do echo $sample
+  for region in cov/mutRegion/regions/*.merged.bed
+    do 
+    # Remove directory path
+    filename=$(basename "$region")
+    # Remove file extension
+    basename="${filename%.merged.*}"
+    echo $basename
+    bsub -o cov/jobLogs/mutRegionEx.$sample.$basename.out -e cov/jobLogs/mutRegionEx.$sample.$basename.err -q normal -R 'select[mem>=2000] rusage[mem=2000] span[hosts=1]' -M 2000 "module load bedtools2-2.29.0/; bedtools intersect -a $T/cov/exCut/$sample.cov.bed -b cov/mutRegion/regions/$basename.merged.bed | cut -f 4 | paste -sd+ - | bc | sed 's/$/\t$sample\t$basename/'  >  cov/mutRegion/twinsUK/$sample.$basename.txt"
+  done
+done
+
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/cov/mutRegion/twinsUK/
+cat *.txt > mutRegionsCovs.tsv
+
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/cov/mutRegion/
+
+for region in regions/*.merged.bed
+  do 
+  # Remove directory path
+  filename=$(basename "$region")
+  # Remove file extension
+  basename="${filename%.merged.*}"
+  echo $basename
+  module load bedtools2-2.29.0/; bedtools intersect -a twinsUK/muts/twinsUKtargVars.sorted.bed -b regions/$basename.merged.bed | cut -f 1,3 | sed "s/$/\t$basename/" >  twinsUK/muts/$basename.txt
+done
+
+```
+
+
+
+## c) dNdS
+First obtain dNdS_basePairCov_mini.zip & unzip 
+### Examine gene level coverage
+Creates the simple gene level coverage file that can be used in default dnds duplex cov correction
+#### Generate files
+```{bash dndscov, eval=FALSE}
+# Run for targ 
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/dNdS_basePairCov/
+mkdir -p covTarg
+mkdir -p inputFor_dNdS
+
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/dNdS_basePairCov/covTarg 
+for sample in `grep "PD6" ../../../germanTrioSamplesFiltered.txt | cut -f1 `;
+  do ln -s <hpc_scratch>/sperm/germanTrio_data/postNextflow/cov/source/$sample.cov.bed .
+done
+
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/dNdS_basePairCov/covTarg 
+bsub -e %J.err -o %J.out -q normal -R 'select[mem>=1000] rusage[mem=1000] span[hosts=1]' -M 1000 'module load bedtools2-2.29.0/; perl ../coverage4dndscv.pl *.bed'
+```
+
+#### Edit gene lists
+```{r dndscovGenes}
+# Mean coverage per gene in targeted
+covPerGene <- read_tsv(paste0(dndsPath, "covTarg/coverage_info.tsv"), col_types = cols()) |> 
+  # I typically filter genes under a certain threshold that have barely any coverage, you can skip this if you want
+  filter(dplx_cov_total > 10000000) |> 
+  # 
+  filter(!gene %in% c("RP11-729L2.2", "CSNK2B-LY6G5B-1181"))
+  
+vCov <- covPerGene |> pull(dplx_cov_mean)
+names(vCov) <- covPerGene |> pull(gene)
+
+save(vCov, file = paste0(localPath, "data/dndsCov.Rdata"))
+save(vCov, file = paste0(dndsPath, "inputFor_dNdS/dndsCov.Rdata"))
+
+covPerGene |> mutate(target = "targeted") |> 
+  ggplot(aes(dplx_cov_mean, colour = target)) +
+  geom_density() +
+  scale_x_log10() +
+  theme_minimal()
+```
+
+### Prep input files
+#### Variant files
+```{r variantsPenta}
+allVars <- germanTrioTargVars |> filter(Cohort == "DD fathers") |> 
+  select(sampleID = PD_ID, chr, pos = start, ref, mut = alt) |> 
+  distinct()
+
+# TwinsUK control exome vars for global dnds test comparison
+tukVars <- read_tsv(paste0(TUKpath, "data/analysisTargVars.tsv"), col_types = cols()) |> filter(nanoseq == "Exome") |> 
+  filter(!Sample_PD_ID %in% c("PD50508f_tds0001", "PD50527b_tds0001")) |> #exclude 2 samples which fail this studies QC criteria
+  select(sampleID = PD_ID, chr, pos = start, ref, mut = alt) |> 
+  distinct()
+
+# Age cut off for comp without age bias
+tukVarsAge <- read_tsv(paste0(TUKpath, "data/analysisTargVars.tsv"), col_types = cols()) |> filter(nanoseq == "Exome" & age_at_sampling <63) |> 
+    filter(!Sample_PD_ID %in% c("PD50508f_tds0001", "PD50527b_tds0001")) |> #exclude 2 samples which fail this studies QC criteria
+  select(sampleID = PD_ID, chr, pos = start, ref, mut = alt) |> 
+  distinct()
+
+# Write to cluster for running penta models
+write_tsv(allVars, paste0(dndsPath, "inputFor_dNdS/allVars.tsv"))
+write_tsv(tukVars, paste0(dndsPath, "inputFor_dNdS/tukVars.tsv"))
+write_tsv(tukVarsAge, paste0(dndsPath, "inputFor_dNdS/tukVarsAge.tsv"))
+```
+
+###  Build reference
+Can run once to create new opportunity matrices to the reference object.
+Update if coverage file changes
+```{r bp_dnds_setup}
+source(paste0(dndsPath, "R/build_bp_refdb.R"))
+source(paste0(dndsPath, "R/dndscvAnnotPenta.R"))
+
+RefCDS_bp <- build_bp_refdb(
+  refcds_path = paste0(dndsPath, "dataFiles/refcds_hg19.rda"), 
+  coverage_path =  paste0(path, "sperm/germanTrio_data/postNextflow/cov/totalCov.bed"), 
+  gene_list = names(vCov),
+  build_tri = TRUE,
+  build_penta = TRUE, 
+  build_meth = TRUE,
+  methylation_path = paste0(path, "genomicRegions/methylation/testisMeth19.germanTrioCov.bed"),
+  genome_fasta = paste0(path, "genomicRegions/genome.fa"), 
+  out_path = paste0(dndsPath, "output/germanTrio_refcds_bp.Rdat")
+)
+```
+
+### Run dNdS
+#### Function to save as dndsPath/run_dnds_gene.R
+```{r bp_dnds_setup}
+#!/usr/bin/env Rscript
+
+args <- commandArgs(trailingOnly = TRUE)
+
+if (length(args) < 2) {
+  stop(
+    paste0(
+      "Usage:\n",
+      "  Rscript run_dnds_gene.R <referenceVersion> <geneSet>\n\n",
+      "Examples:\n",
+      "  Rscript run_dnds_gene.R Tri Panel\n",
+      "  Rscript run_dnds_gene.R TriMeth Panel\n",
+      "  Rscript run_dnds_gene.R Penta Panel\n",
+      "  Rscript run_dnds_gene.R PentaMeth Panel\n"
+    )
+  )
+}
+
+referenceVersion <- args[1]  # Tri / TriMeth / Penta / PentaMeth
+geneSet          <- args[2]  # Panel or a filename (without .tsv) in geneLists/
+
+suppressPackageStartupMessages({
+  library(dndscv)
+  library(tidyverse)
+})
+
+# -----------------------------
+# Paths (edit once)
+# -----------------------------
+dndsPath <- "<hpc_scratch>/sperm/germanTrio_data/postNextflow/dNdS_basePairCov/"
+inDir    <- file.path(dndsPath, "inputFor_dNdS")
+resDir   <- file.path(dndsPath, "output")
+
+
+# -----------------------------
+# Inputs you already have in the new workflow
+# -----------------------------
+# Keep these exactly as per your current setup
+refdb      <- file.path(dndsPath, "output/germanTrio_refcds_bp.Rdat")
+genomefile <- "<hpc_references>/pipeline_ref/Human/GRCh37d5/genome.fa"
+
+# Covariates and gene universe
+load(file.path(inDir, "covariates_hg19_hg38_epigenome_pcawg.rda"))  # loads covs
+load(file.path(inDir, "dndsCov.Rdata"))                             # expects vCov
+
+# Mutations (choose which one you want as the default run input)
+mutations_file <- file.path(inDir, "allVars.tsv")
+mutations <- read_tsv(mutations_file, col_types = cols()) |>
+  dplyr::select(sampleID, chr, pos, ref, mut) |>
+  dplyr::distinct()
+
+# Gene list
+gene_list <- NULL
+if (geneSet == "Panel") {
+  gene_list <- names(vCov)
+} else {
+  gene_list <- read_tsv(file.path(inDir, paste0(geneSet, ".tsv")), col_types = cols()) |>
+    dplyr::filter(gene %in% names(vCov)) |>
+    dplyr::pull(gene)
+}
+
+# Methylation file (only used for *Meth models)
+methylationFile <- "<hpc_scratch>/genomicRegions/methylation/testisMeth19.germanTrioCov.bed"
+
+# -----------------------------
+# Source your current code (must define dndscv_BP)
+# -----------------------------
+# Change this to wherever dndscv_BP() lives in your repo
+source(file.path(dndsPath, "R/dndsPentaMethBPfunction.R"))
+
+# -----------------------------
+# Run
+# -----------------------------
+common_args <- list(
+  mutations = mutations,
+  refdb = refdb,
+  referenceVersion = referenceVersion,
+  cv = covs,
+  gene_list = gene_list,
+  genomefile = genomefile,
+  max_muts_per_gene_per_sample = Inf,
+  max_coding_muts_per_sample = Inf,
+  outmats = TRUE
+)
+
+if (grepl("Meth", referenceVersion)) {
+  common_args$methylationFile <- methylationFile
+}
+
+out <- do.call(dndscv_BP, common_args)
+
+# -----------------------------
+# Write outputs
+# -----------------------------
+tag <- paste(referenceVersion, geneSet, sep = "_")
+
+write_tsv(out$annotmuts,    file.path(resDir, paste0("annotmuts_", tag, ".tsv")))
+write_tsv(out$globaldnds,   file.path(resDir, paste0("globaldnds_", tag, ".tsv")))
+write_tsv(out$sel_cv,       file.path(resDir, paste0("sel_cv_", tag, ".tsv")))
+write_tsv(out$mle_submodel, file.path(resDir, paste0("mle_submodel_", tag, ".tsv")))
+
+aic <- AIC(out$poissmodel)
+write_tsv(tibble(AIC = aic), file.path(resDir, paste0("aic_", tag, ".tsv")))
+
+save(out, file = file.path(resDir, paste0("dndsout_", tag, ".Rdata")))
+```
+
+#### Submit jobs
+```{bash dndsComp, eval=FALSE}
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/dNdS_basePairCov
+mkdir -p jobLogs
+rm jobLogs/*
+
+bsub -o jobLogs/Tri_Panel.out -e jobLogs/Tri_Panel.err -q normal -R 'select[mem>=2000] rusage[mem=2000] span[hosts=1]' -M 2000 \
+  Rscript run_dnds_gene.R Tri Panel
+
+bsub -o jobLogs/TriMeth_Panel.out  -e jobLogs/TriMeth_Panel.err  -q normal -R 'select[mem>=2000] rusage[mem=2000] span[hosts=1]' -M 2000 \
+  Rscript run_dnds_gene.R TriMeth Panel
+
+bsub -o jobLogs/Penta_Panel.out    -e jobLogs/Penta_Panel.err    -q normal -R 'select[mem>=12000] rusage[mem=12000] span[hosts=1]' -M 12000 \
+  Rscript run_dnds_gene.R Penta Panel
+
+bsub -o jobLogs/PentaMeth_Panel.out -e jobLogs/PentaMeth_Panel.err -q normal -R 'select[mem>=12000] rusage[mem=12000] span[hosts=1]' -M 12000 \
+  Rscript run_dnds_gene.R PentaMeth Panel
+
+```
+
+##### Submit TUK comp 
+edited run_dnds_gene.R to run_dnds_geneTUK.R which has "inputFor_dNdS/mutationsInput/tukVarsMeth.tsv" as mutations input file and TUK output name
+```{bash dndsComp, eval=FALSE}
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/dnds/inputFor_dNdS
+bsub -o jobLogs/methtriTUK.out -e jobLogs/methtriTUK.err -q normal -R 'select[mem>=1200] rusage[mem=1200] span[hosts=1]' -M 1200 Rscript runPentaTUK.R TriMeth Panel
+bsub -o jobLogs/methtriTUKage.out -e jobLogs/methtriTUKage.err -q normal -R 'select[mem>=1200] rusage[mem=1200] span[hosts=1]' -M 1200 Rscript runPentaTUKage.R TriMeth Panel
+```
+
+#### Gene lists
+```{r genelists}
+
+# Create the methylation matrix (same as before)
+#Tri meth sub model
+# TRI -------------------------------------------------------------
+nt = c("A", "C", "G", "T")
+trinucs = paste(rep(nt, each = 16, times = 1), rep(nt, each = 4, times = 4), rep(nt, each = 1, times = 16), sep = "")
+trinucinds = setNames(1:64, trinucs)
+trinucsubs = NULL
+for (j in 1:length(trinucs)) {
+  trinucsubs = c(trinucsubs, paste(trinucs[j], paste(substr(trinucs[j], 
+                                                            1, 1), setdiff(nt, substr(trinucs[j], 2, 2)), substr(trinucs[j], 
+                                                                                                                 3, 3), sep = ""), sep = ">"))}
+trinucsubsind = setNames(1:192, trinucsubs)
+# Meth
+methSubs = trinucsubs
+for (j in 1:length(trinucsubs)) {
+  # Check for C>T substitution at CpG site: C>T means 6th character is "T"
+  if (substr(trinucsubs[j], 6, 6) == "T" && substr(trinucsubs[j], 2, 2) == "C" && substr(trinucsubs[j], 3, 3) == "G") {
+    # Add z_high and z_low prefixed substitutions for C>T at CpG
+    methSubs = c(methSubs, 
+                 paste0("z_High", trinucsubs[j]),
+                 paste0("z_Low", trinucsubs[j]))
+  }
+  # Check for G>A substitution at reverse CpG site: G>A means 6th character is "A"
+  if (substr(trinucsubs[j], 6, 6) == "A" && substr(trinucsubs[j], 2, 2) == "G" && substr(trinucsubs[j], 1, 1) == "C") {
+    # Add z_high and z_low prefixed substitutions for G>A at reverse CpG
+    methSubs = c(methSubs, 
+                 paste0("z_High", trinucsubs[j]),
+                 paste0("z_Low", trinucsubs[j]))
+  }
+}
+# Create indices for methSubs
+methSubsInd = setNames(1:length(methSubs), methSubs)
+M_matrix = array("",dim=c(length(methSubs), 4))
+M_matrix[,1] = methSubs
+M_matrix[,2] = paste(methSubs,"*wmis",sep="")
+M_matrix[,3] = paste(methSubs,"*wnon",sep="")
+M_matrix[,4] = paste(methSubs,"*wspl",sep="")
+substmodelMeth <- M_matrix
+
+# Source the custom function
+source(paste0("<hpc_scratch>/sperm/germanTrio_data/postNextflow/dnds/", "inputFor_dNdS/geneSetEnrich/genesetdndsMutCount.R"))
+
+# For new genes in TUK data
+load(paste0("<hpc_scratch>/sperm/germanTrio_data/postNextflow/dnds/", "inputFor_dNdS/results/dndsout_TriMethPanel.tuk.Rdata"))
+geneList <- sigComp |> filter(dndsLabel == "DD fathers") |> pull(gene_name)
+geneSetEnrichNew <- genesetdndsMutCount(output, gene_list = geneList, sm = substmodelMeth)
+
+# For old genes in DD data
+load(paste0(dndsPath, "output/dndsout_TriMeth_Panel.Rdata"))
+geneList2 <- sigComp |> filter(dndsLabel == "Controls") |> pull(gene_name)
+geneSetEnrichOld <- genesetdndsMutCount(out, gene_list = geneList2, sm = substmodelMeth)
+```
+
+
+### Model comp summary
+#### Basic model
+```{r dndsGlobalComp}
+# No corrections
+load(paste0(dndsPath, "inputFor_dNdS/dndsCov.Rdata"))
+load(paste0(path, "dndsObjects/covariates_hg19_hg38_epigenome_pcawg.rda"))  # loads covs
+allVars <- read_tsv(paste0(dndsPath, "inputFor_dNdS/allVars.tsv"), col_types = cols())
+
+dndsBasic <- dndscv(allVars, max_muts_per_gene_per_sample = Inf, max_coding_muts_per_sample = Inf,
+                            outmats = T, cv = covs, gene_list = names(vCov))
+
+dndsGeneLevel <- dndscv(allVars, max_muts_per_gene_per_sample = Inf, max_coding_muts_per_sample = Inf,
+                            outmats = F, dc = vCov, cv = covs, gene_list = names(vCov))
+
+```
+
+#### Compare global
+```{r dndsGlobalComp}
+
+# Collect globaldnds values
+compGlobal_dNdS <- dndsBasic$globaldnds  |> mutate(test = "Basic") |> 
+  bind_rows(read_tsv(paste0(dndsPath, "output/globaldnds_Tri_Panel.tsv"), col_types = cols()) |> 
+            mutate(test = "BasePairCov")) |> 
+  bind_rows(read_tsv(paste0(dndsPath, "output/globaldnds_TriMeth_Panel.tsv"), col_types = cols()) |> 
+          mutate(test = "BasePairCov + CpGmeth")) |> 
+  bind_rows(read_tsv(paste0(dndsPath, "output/globaldnds_PentaMeth_Panel.tsv"), col_types = cols()) |> 
+              mutate(test = "BasePairCov + CpGmeth + Penta")) |> 
+  mutate(name = str_remove(name, "w"))
+write_tsv(compGlobal_dNdS, paste0(localPath, "data/compGlobal_dNdS.tsv"))
+
+p_compGlobal_dNdS <- compGlobal_dNdS |> 
+  filter(name != "tru") |> 
+  mutate(test = fct_inorder(test)) |> 
+  ggplot(aes(x = name, y = mle, colour = test)) +
+  geom_pointrange(aes(ymin = cilow, ymax = cihigh), position=position_dodge(width = 0.5)) +
+  geom_hline(yintercept = 1, linetype = "dashed") + 
+  scale_colour_discrete(name = "dNdScv model") +
+  ylab("Global dN/dS") + xlab("Mutation class") +
+  theme_pubr() +
+  theme(legend.position = c(0.3, 0.8), legend.text = element_text(size = 10), legend.title = element_text(size = 12), axis.title.x = element_blank())
+
+p_compGlobal_dNdS
+```
+
+#### Compare sig genes
+```{r dndsGlobalComp, fig.height = 7, fig.width=4}
+
+basic_ranked_genes <- read_tsv(paste0(dndsPath, "output/sel_cv_TriMeth_Panel.tsv"), col_types = cols()) |>
+  arrange(-qglobal_cv) |> 
+  pull(gene_name)
+compGene_dNdS <- read_tsv(paste0(dndsPath, "output/sel_cv_Tri_Panel.tsv"), col_types = cols()) |> 
+  mutate(test = "BasePairCov") |> 
+  bind_rows(read_tsv(paste0(dndsPath, "output/sel_cv_TriMeth_Panel.tsv"), col_types = cols()) |> 
+              mutate(test = "BasePairCov +\nCpGmeth")) |> 
+  bind_rows(
+    read_tsv(paste0(dndsPath, "output/sel_cv_PentaMeth_Panel.tsv"), col_types = cols()) |> 
+      mutate(test = "BasePairCov +\nCpGmeth +\nPenta")) |> 
+  bind_rows(
+    dndsBasic$sel_cv |> 
+      mutate(test = "Basic")) |> 
+  filter(qglobal_cv < 0.01) |>
+  select(gene_name, test, qglobal_cv) |> 
+  mutate(Significant = ifelse(qglobal_cv < .0001, "***", ifelse(qglobal_cv < .001, "**", ifelse(qglobal_cv < .01, "*", " ")))) |> 
+  complete(gene_name, test, fill = list(Significant = "NS")) |> 
+  mutate(Significant = factor(Significant, levels = c("***", "**", "*", "NS"))) |> # Set order for significance
+  mutate(test = factor(test, levels = c("Basic", "BasePairCov", "BasePairCov +\nCpGmeth", "BasePairCov +\nCpGmeth +\nPenta"))) |> # Set order for significance
+  mutate(gene_name = factor(gene_name, levels = basic_ranked_genes)) |> 
+  filter(!gene_name %in% c("SEMG1", "MECP2"))
+
+
+p_compGene_dNdS <- ggplot(compGene_dNdS, aes(x = test, y = gene_name, label = Significant)) +
+  geom_tile(color = "black", fill = "white") +
+  geom_text() +
+  labs(x = "Test Type", y = "Gene", text = "Significance") +
+  theme_pubr() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 9), axis.text.y = element_text(size = 9), legend.position = "right",
+        legend.text = element_text(size = 8), legend.title = element_text(size = 12),axis.title.x = element_blank(),
+        axis.line.x = element_blank(), axis.line.y = element_blank(), axis.ticks = element_blank())
+
+p_compGene_dNdS
+
+```
+
+#### Penta context
+Check if any penta contexts are signficantly different from trinucleotide contexts
+```{r dndsPentaContext}
+tri <- read_tsv(paste0(dndsPath, "output/mle_submodel_TriMeth_Panel.tsv"), col_types = cols())|> 
+  filter(!name %in% c("wmis", "wspl", "wnon")) |> 
+    # Handle meth
+  mutate(meth = if_else(str_detect(name, "z_High"), "High", "Mid")) |> mutate(meth = if_else(str_detect(name, "z_Low"), "Low", meth)) |> 
+  mutate(name = if_else(str_detect(name, "z_High"), str_sub(name, 7,14), name)) |> mutate(name = if_else(str_detect(name, "z_Low"), str_sub(name, 6,13), name)) |> 
+  dplyr::rename(tri = name, triRate = mle, tricilow = cilow, tricihigh = cihigh)
+
+penta <- read_tsv(paste0(dndsPath, "output/mle_submodel_PentaMeth_Panel.tsv"), col_types = cols()) |> 
+  # Remove no estimate
+  filter(!name %in% c("wmis", "wspl", "wnon")) |> 
+  # Handle meth
+  mutate(meth = if_else(str_detect(name, "z_High"), "High", "Mid")) |> mutate(meth = if_else(str_detect(name, "z_Low"), "Low", meth)) |> 
+  mutate(name = if_else(str_detect(name, "z_High"), str_sub(name, 7,18), name)) |> mutate(name = if_else(str_detect(name, "z_Low"), str_sub(name, 6,17), name)) |> 
+  dplyr::rename(penta = name, pentaRate = mle, pentacilow = cilow, pentacihigh = cihigh) |> 
+  mutate(tri = paste0(str_sub(penta,2,4), ">", str_sub(penta,8,10)))
+
+# Function to calculate standard error from confidence interval
+calc_se <- function(ci_high, ci_low) {
+  (ci_high - ci_low) / (2 * 1.96)  # CI to SE conversion assuming 95% CI
+}
+
+# Calculate the difference in rates, their standard errors, z-scores, and FDR-corrected p-values
+pentaCompare <- penta |> left_join(tri, join_by(meth, tri)) |>
+  mutate(
+    # Calculate standard errors for pentanucleotide and trinucleotide contexts
+    penta_se = calc_se(pentacihigh, pentacilow),
+    tri_se = calc_se(tricihigh, tricilow),
+    
+    # Calculate the difference in mutation rates
+    rate_diff = pentaRate - triRate,
+    
+    # Combined standard error for the difference
+    diff_se = sqrt(penta_se^2 + tri_se^2),
+    
+    # Calculate z-score for the difference
+    z_score = rate_diff / diff_se,
+    
+    # p-value from z-score (two-tailed test)
+    p_value = 2 * pnorm(-abs(z_score)),
+    
+    # FDR-corrected p-value (Benjamini-Hochberg correction)
+    p_adj_fdr = p.adjust(p_value, method = "fdr")
+  )
+
+pentaSig = pentaCompare |> arrange(p_adj_fdr) |> mutate(sig = if_else(p_adj_fdr < 0.05, T, F))
+
+```
+
+### Site dnds
+#### Basic (default dnds)
+```{r standardHostpot_dnds}
+hotspots_dndsBasic = sitednds(dndsBasic, min_recurr = 3, gene_list = names(vCov))
+
+hotspots_dndsBasicSig <- hotspots_dndsBasic$recursites |>
+  mutate(across(c(freq, dnds, pval), \(x) as.numeric(vapply(x, \(z) unname(z)[1], numeric(1)))),
+         significant = if_else(qval < 0.01, "*", "")) |> 
+  filter(significant == "*")
+
+write_tsv(hotspots_dndsBasicSig, paste0(localPath, "data/siteHotspots_dnds_sig.tsv"))
+```
+
+#### Base pair coverage corrected
+BP-aware sitednds uses duplex exposure at the exact base (dx_cov): expected mu is proportional to how many cells/molecules were observed there.
+```{r bpHostpot_dnds}
+
+source(paste0(dndsPath, "R/sitedndsBP.R"))
+load(paste0(dndsPath, "output/dndsout_Tri_Panel.Rdata"))
+
+hotspotsBP <- sitednds(
+  dndsout = out,
+  refdb_bp = paste0(dndsPath, "output/germanTrio_refcds_bp.Rdat"),
+  coverageFile = "<hpc_scratch>/sperm/germanTrio_data/postNextflow/cov1/totalCov.bed",
+  min_recurr = 3,
+  gene_list = names(vCov)
+)
+
+hotspotsBPSig <- hotspotsBP$recursites |>
+  mutate(significant = if_else(qval < 0.01, "*", "")) 
+
+write_tsv(hotspotsBPSig |> filter(significant == "*") |> select(-significant), paste0(localPath, "data/siteHotspots_dndsBP_sig.tsv"))
+write_tsv(hotspotsBPSig, paste0(localPath, "data/siteHotspots_dndsBP_all.tsv"))
+
+```
+
+##### SupFig 3
+```{r dndsGlobalComp, fig.height = 6, fig.width=10}
+p_compGlobal_dNdS + p_compGene_dNdS + plot_layout(widths = c(2,1)) + plot_annotation(tag_levels = "A") &
+    theme(plot.tag = element_text(size = 14, face = "bold"))
+
+png(paste0(manuscriptPath, 'Figures/SupFig3_dndsModel.png'), height=6, width=10, res=300, units = "in")
+p_compGlobal_dNdS + p_compGene_dNdS + plot_layout(widths = c(2,1)) + plot_annotation(tag_levels = "A") &
+    theme(plot.tag = element_text(size = 14, face = "bold"))
+dev.off()
+pdf(paste0(manuscriptPath, 'Figures/SupFig3_dndsModel.pdf'), height=6, width=10, onefile = F)
+p_compGlobal_dNdS + p_compGene_dNdS + plot_layout(widths = c(2,1)) + plot_annotation(tag_levels = "A") &
+    theme(plot.tag = element_text(size = 14, face = "bold"))
+dev.off()
+```
+
+### Review Analysis: SCN1A dN/dS exclusion
+#### Prepare filtered variant input
+```{r scn1a_dnds_prep}
+# Filter germanTrioTargVars to DD fathers excluding SCN1A-ascertained sperm samples.
+# scn1a_sperm_ids is defined in the scn1a_ids chunk above.
+allVars_scn1a <- germanTrioTargVars |>
+  filter(Cohort == "DD fathers", !Sample_PD_ID %in% scn1a_sperm_ids) |>
+  select(sampleID = PD_ID, chr, pos = start, ref, mut = alt) |>
+  distinct()
+
+cat("Variants in manuscript allVars:    ", nrow(germanTrioTargVars), "\n")
+cat("Variants in SCN1A-excluded allVars:", nrow(allVars_scn1a), "\n")
+cat("Samples removed:", length(scn1a_sperm_ids), "\n")
+
+write_tsv(allVars_scn1a, paste0(dndsPath, "inputFor_dNdS/allVars_scn1a.tsv"))
+```
+
+#### Write SCN1A-excluded run script for HPC
+```{r scn1a_dnds_script, eval=FALSE}
+# Writes run_dnds_gene_scn1a.R to dndsPath — identical to run_dnds_gene.R except
+# the mutations input points to allVars_scn1a.tsv and outputs are tagged _scn1a.
+script_lines <- readLines(paste0(dndsPath, "run_dnds_gene.R"))
+script_lines <- gsub(
+  'mutations_file <- file.path(inDir, "allVars.tsv")',
+  'mutations_file <- file.path(inDir, "allVars_scn1a.tsv")',
+  script_lines, fixed = TRUE
+)
+script_lines <- gsub(
+  'tag <- paste(referenceVersion, geneSet, sep = "_")',
+  'tag <- paste(referenceVersion, geneSet, "scn1a", sep = "_")',
+  script_lines, fixed = TRUE
+)
+writeLines(script_lines, paste0(dndsPath, "run_dnds_gene_scn1a.R"))
+cat("Written to", paste0(dndsPath, "run_dnds_gene_scn1a.R"), "\n")
+```
+
+#### Submit HPC job
+```{bash scn1a_dnds_submit, eval=FALSE}
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/dNdS_basePairCov
+bsub -e jobLogs/%J_scn1a_TriMeth.err \
+     -o jobLogs/%J_scn1a_TriMeth.out \
+     -q long \
+     -R 'select[mem>=8000] rusage[mem=8000] span[hosts=1]' \
+     -M 8000 \
+     "Rscript run_dnds_gene_scn1a.R TriMeth Panel"
+```
+
+#### Compare global dN/dS: manuscript vs SCN1A excluded
+```{r scn1a_dnds_global, fig.width=4, fig.height=4}
+# Extend p_globaldnds (Fig 2a) with a third bar for SCN1A-excluded DD fathers.
+# Matches Fig 2a exactly: wall only, geom_col + errorbar, dataset_colours palette.
+scn1a_colour <- "#f4b88c"  # lighter shade of DD fathers orange
+
+global_scn1a_data <- bind_rows(
+  read_tsv(paste0(dndsPath, "output/globaldnds_TriMeth_Panel.tsv"), col_types = cols()) |>
+    mutate(dataset = "DD fathers"),
+  read_tsv(paste0("<hpc_scratch>/sperm/germanTrio_data/postNextflow/dnds/",
+                  "inputFor_dNdS/results/globaldnds_TriMethPanel.tukAge.tsv"),
+           col_types = cols()) |>
+    mutate(dataset = "Controls"),
+  read_tsv(paste0(dndsPath, "output/globaldnds_TriMeth_Panel_scn1a.tsv"), col_types = cols()) |>
+    mutate(dataset = "DD fathers\n(SCN1A excl.)")
+) |>
+  filter(name == "wall") |>
+  mutate(dataset = factor(dataset,
+                          levels = c("DD fathers", "DD fathers\n(SCN1A excl.)", "Controls")))
+
+p_global_scn1a <- ggplot(global_scn1a_data,
+       aes(x = dataset, y = mle, fill = dataset)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_errorbar(aes(ymin = cilow, ymax = cihigh),
+                position = position_dodge(width = 0.8),
+                width = 0.2, colour = "black") +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  scale_fill_manual(values = c(dataset_colours,
+                                "DD fathers\n(SCN1A excl.)" = scn1a_colour)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(x = NULL, y = "Global dN/dS (220 gene panel)") +
+  theme_pubr() +
+  theme(axis.title.x = element_blank(), legend.position = "none",
+        axis.text.x  = element_text(size = 9))
+
+p_global_scn1a
+```
+
+#### Compare gene-level significance: manuscript vs SCN1A excluded
+```{r scn1a_dnds_genes, fig.width=5, fig.height=6}
+# Manuscript gene-level results (TriMeth)
+genes_manuscript <- read_tsv(paste0(dndsPath, "output/sel_cv_TriMeth_Panel.tsv"),
+                              col_types = cols()) |>
+  mutate(dataset = "Manuscript")
+
+# SCN1A-excluded gene-level results
+genes_scn1a <- read_tsv(paste0(dndsPath, "output/sel_cv_TriMeth_Panel_scn1a.tsv"),
+                         col_types = cols()) |>
+  mutate(dataset = "SCN1A excluded")
+
+# Universe: genes significant in the manuscript (q < 0.01), same filter as main figure
+sig_genes_manuscript <- genes_manuscript |>
+  filter(qglobal_cv < 0.01) |>
+  pull(gene_name)
+
+gene_comp <- bind_rows(genes_manuscript, genes_scn1a) |>
+  filter(gene_name %in% sig_genes_manuscript) |>
+  select(gene_name, dataset, qglobal_cv) |>
+  mutate(
+    sig_label = case_when(
+      qglobal_cv < 0.0001 ~ "***",
+      qglobal_cv < 0.001  ~ "**",
+      qglobal_cv < 0.01   ~ "*",
+      TRUE                ~ "NS"
+    ),
+    sig_label = factor(sig_label, levels = c("***", "**", "*", "NS")),
+    dataset   = factor(dataset, levels = c("Manuscript", "SCN1A excluded")),
+    gene_name = factor(gene_name,
+                       levels = genes_manuscript |>
+                         arrange(qglobal_cv) |>
+                         pull(gene_name))
+  )
+
+p_genes_scn1a <- ggplot(gene_comp, aes(x = dataset, y = gene_name, label = sig_label)) +
+  geom_tile(colour = "black", fill = "white") +
+  geom_text(size = 4) +
+  labs(x = NULL, y = NULL) +
+  theme_pubr() +
+  theme(axis.text.x  = element_text(angle = 45, hjust = 1),
+        axis.line.x  = element_blank(), axis.line.y  = element_blank(),
+        axis.ticks   = element_blank())
+
+p_genes_scn1a
+```
+
+
+## d) Observed VAFs
+### TwinsUK control rates
+```{r twinsUKrates}
+tukExomeVars <- read_tsv(paste0(TUKpath, "data/analysisTargVars.tsv"), col_types = cols()) |> 
+  filter(nanoseq == "Exome") |> filter(!Sample_PD_ID %in% c("PD50508f_tds0001", "PD50527b_tds0001"))
+  
+tukVars0 <- tukExomeVars |> 
+  mutate(varID = paste(chr, start,ref,alt,Sample_PD_ID, sep = "_")) |> 
+  mutate(bedStart = start - 1) 
+write_tsv(tukVars0 |> select(chr, bedStart, start, varID), paste0(path, "sperm/germanTrio_data/postNextflow/diseaseRates/tukVars0.bed"), col_names = F)
+
+tukAllVars <- read_tsv(paste0(TUKpath, "data/analysisTargVars.tsv"), col_types = cols())
+tukAllVars0 <- tukAllVars |> 
+  mutate(varID = paste(chr, start,ref,alt,Sample_PD_ID, sep = "_")) |> 
+  mutate(bedStart = start - 1) 
+write_tsv(tukAllVars0 |> select(chr, bedStart, start, varID), paste0(path, "sperm/germanTrio_data/postNextflow/diseaseRates/tukVarsAll0.bed"), col_names = F)
+```
+
+#### Vars intersect with german panel
+```{bash intPanel, eval=FALSE}
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/diseaseRates
+sort -k1,1 -k2,2n tukVars0.bed > tukVars0_sorted.bed
+
+module load bedtools2-2.29.0/
+bedtools intersect -a tukVars0_sorted.bed -b ../cov/totalCovMerged.bed -wa > tukVarsGermanPanel.bed
+```
+
+#### Cov intersect with german panel
+```{bash intPanel, eval=FALSE}
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/cov/twinsUKcontrol/
+
+for sample in `grep "exome" <hpc_scratch>/sperm/targeted/targetedSamplesFiltered.txt | cut -f1`;
+  do echo $sample
+  bsub -o jobLogs/covCut.$sample.out -e jobLogs/covCut.$sample.err -q normal -R 'select[mem>=4000] rusage[mem=4000] span[hosts=1]' -M 4000 "module load bedtools2-2.29.0/;  bedtools intersect -sorted -a $T/cov/exCut/$sample.cov.bed -b ../totalCovMerged.bed > $sample.germanPanelCovEx.bed"
+done
+
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/cov/twinsUKcontrol/
+for sample in `grep "targeted" <hpc_scratch>/sperm/targeted/targetedSamplesFiltered.txt | cut -f1`;
+  do echo $sample
+  bsub -o jobLogs/covCut.$sample.out -e jobLogs/covCut.$sample.err -q normal -R 'select[mem>=100] rusage[mem=100] span[hosts=1]' -M 100 "module load bedtools2-2.29.0/;  bedtools intersect -sorted -a $T/cov/targCut/$sample.cov.bed -b ../totalCovMerged.bed > $sample.germanPanelCovTarg.bed"
+done
+
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/cov/twinsUKcontrol/
+rm twinsUK_germanPanelCov.tsv
+
+for sample in $(cut -f1 <hpc_scratch>/sperm/targeted/targetedSamplesFiltered.txt); do
+  echo $sample
+  sum=$(awk '{sum+=$4} END {print sum}' $sample.*.bed)
+  count=$(wc -l < $sample.*.bed | awk '{sum+=$1} END {print sum}')
+  echo -e "$sum\t$count\t$sample" >> twinsUK_germanPanelCov.tsv
+done
+
+```
+
+### Calculate obs VAFs
+```{r vafSummary}
+generate_vaf_summary <- function(variant_data) {
+  variant_data |> 
+    filter(csq == "synonymous" & TYPE == "snv") |> mutate(vafGroup = "synonymous") |> 
+    bind_rows(variant_data |> filter(csq == "missense" & TYPE == "snv") |> mutate(vafGroup = "missense"))  |> 
+    bind_rows(variant_data |> filter(IMPACT != "MODIFIER" & TYPE == "snv") |> mutate(vafGroup = "coding"))  |> 
+    bind_rows(variant_data |> filter(IMPACT == "MODIFIER" & TYPE == "snv") |> mutate(vafGroup = "non-coding"))  |> 
+    bind_rows(variant_data |> filter(IMPACT == "HIGH" & TYPE == "snv") |> mutate(vafGroup = "LOF_snv"))  |> 
+    bind_rows(variant_data |> filter(ClinVar) |> mutate(vafGroup = "Clin")) |> 
+    bind_rows(variant_data |> filter((ClinVar | (gene %in% dddLOF & IMPACT == "HIGH"))) |> mutate(vafGroup = "ClinDDlof")) |> 
+    bind_rows(variant_data |> filter((ClinVar | (gene %in% dddLOF & IMPACT == "HIGH") | (gene %in% dddLOF & cadd >= 30 & gnomADe_AF < 5e-6))) |> mutate(vafGroup = "ClinDDlofCADD")) |> 
+    bind_rows(variant_data |> filter(ClinVar & str_detect(PHEN, "RASopathy")) |> mutate(vafGroup = "Rasopathy")) |> 
+    bind_rows(variant_data |> filter(ClinVar & str_detect(PHEN, "Hereditary_cancer-predisposing_syndrome")) |> mutate(vafGroup = "CancerPredisposing")) |> 
+    bind_rows(variant_data |> filter(start == 1806119 & str_detect(PHEN, "Achondroplasia") & ClinVar) |>  mutate(vafGroup = "Achondroplasia")) |> 
+    bind_rows(variant_data |> filter(str_detect(PHEN, "oonan")) |> filter(!str_detect(PHEN, "eurofibromatosis") & ClinVar) |> mutate(vafGroup = "Noonan")) |>
+    bind_rows(variant_data |> mutate(var = paste(chr,start,ref,alt, sep = "_")) |> 
+      filter((gene %in% lofSelectionGenes & (IMPACT == "HIGH" | cadd >= 30)) | 
+             (var %in% hotspots$var)) |> mutate(vafGroup = "allPos")) |> 
+    bind_rows(variant_data |> mutate(var = paste(chr,start,ref,alt, sep = "_")) |> 
+      filter((ClinVar | (gene %in% dddLOF & IMPACT == "HIGH") | (gene %in% dddLOF & cadd >= 30 & gnomADe_AF < 5e-6)) & (gene %in% lofSelectionGenes & (IMPACT == "HIGH" | cadd >= 30)) | 
+             (var %in% hotspots$var)) |> mutate(vafGroup = "posPath")) |>
+    bind_rows(variant_data |> filter(gene == "NF1") |> filter((ClinVar & str_detect(PHEN, "eurofibromatosis")) | IMPACT == "HIGH" | cadd >= 30) |>
+      mutate(vafGroup = "NF1")) |> 
+    bind_rows(variant_data |> filter((chr == "10" & start == 123279677 & alt %in% c("C")) | (chr == "10" & start == 123279674 & alt %in% c("C"))) |>
+      mutate(vafGroup = "Apert")) |>
+    bind_rows(variant_data |> filter((str_detect(PHEN, "rouzon") | str_detect(PHEN, "feiffe")) & gene == "FGFR2" & ClinVar) |> mutate(vafGroup = "Crouzon/Pfeiffer")) |> 
+    bind_rows(variant_data |> filter((str_detect(PHEN, "Thanatophoric_dysplasia")) & start!= 1806119 & ClinVar)|> mutate(vafGroup = "Thanatophoric dysplasia")) |> 
+    bind_rows(variant_data |> filter(IMPACT != "MODIFIER" & TYPE != "snv") |> mutate(vafGroup = "coding_indel"))  |> 
+    bind_rows(variant_data |> filter(IMPACT == "MODIFIER" & TYPE != "snv") |> mutate(vafGroup = "non-coding_indel"))  |> 
+    group_by(Sample_PD_ID, Age, vafGroup) |> 
+    summarize(vafSum = sum(DUPLEX_VAF, na.rm = TRUE), countSum = sum(TIMES_CALLED), .groups = "drop") |> 
+    complete(nesting(Sample_PD_ID, Age), vafGroup, fill = list(countSum=0, vafSum = 0)) |> 
+    mutate(method = "obs")
+}
+
+dddLOF <- read_tsv(paste0(localPath, "data/dddLOF.txt"), col_types = cols()) |> pull(gene)
+lofSelectionGenes <- read_tsv(paste0(localPath, "data/lofSelectionGenes.tsv"), col_types = cols()) |> pull(gene)
+hotspots <- read_tsv(paste0(localPath, "data/hotspots.tsv"), col_types = cols())
+
+tukExomeVars <- read_tsv(paste0(TUKpath, "data/analysisTargVars.tsv"), col_types = cols()) |> 
+  filter(nanoseq == "Exome") |> filter(!Sample_PD_ID %in% c("PD50508f_tds0001", "PD50527b_tds0001"))
+tukGermanPanelVars <- tukVars0 |> filter(varID %in% (read_tsv(paste0(path, "sperm/germanTrio_data/postNextflow/diseaseRates/tukVarsGermanPanel.bed"), col_types = 'cccc', col_names = c("a", "b", "c", "varID")) |> pull(varID)))
+
+tukSamplesFiltered <- read_tsv(paste0("<local_working_dir>/nanoSampleMeta/", "targetedSamplesFiltered.tsv"), col_types = cols())
+germanTrioTargVars <- read_tsv(paste0(localPath, "data/germanTrioTargVars.tsv"), col_types = cols())
+
+tukVafSums <- generate_vaf_summary(tukGermanPanelVars |> rename(Age = age_at_sampling, gnomADe_AF = gnomAD_AF)) |> 
+  left_join(tukExomeVafSums) |> filter(!Sample_PD_ID %in% c("PD50508f_tds0001", "PD50527b_tds0001"))
+vafSumsVars <- generate_vaf_summary(germanTrioTargVars)
+
+tukVafSumsExp <- read_tsv(paste0(path, "sperm/twinsUK/expVafSumsTUK.tsv"), col_types = 'dcc', col_names = c("vafSum", "Sample_PD_ID", "vafGroup")) |> 
+  mutate(vafGroup = str_remove(str_remove(vafGroup, "vepCovered"), "_")) |> 
+  # Rename
+  mutate(vafGroup = str_replace(vafGroup, "MODIFIER", "non-coding")) |> 
+  mutate(vafGroup = str_replace(vafGroup, "HIGH", "LOF_snv")) |> 
+  mutate(vafGroup = str_replace(vafGroup, "Thanatophoricdysplasia", "Thanatophoric dysplasia")) |> 
+  mutate(vafGroup = str_replace(vafGroup, "CrouzonPfeiffer", "Crouzon/Pfeiffer")) |> 
+  # Add indel only expectations
+  bind_rows(read_tsv(paste0(path, "sperm/twinsUK/valsExpectedIndelTarg.tsv"), col_types = cols())) |> 
+  # Summarize to combine indel + snv combos
+  group_by(Sample_PD_ID, vafGroup) |> summarize(vafSum = sum(vafSum), .groups = "drop") |> 
+  left_join(tukSamplesFiltered |> select(Sample_PD_ID, age_at_sampling, nanoseq), by = join_by(Sample_PD_ID)) |> 
+  mutate(method = "exp") |> 
+  filter(nanoseq == "Exome")
+
+
+write_tsv(tukVafSumsExp, paste0(localPath, "data/tukVafSumsExp.tsv"))
+write_tsv(tukVafSums, paste0(localPath, "data/tukGermanPanelVafSums.tsv"))
+write_tsv(vafSumsVars, paste0(localPath, "data/vafSumsVars.tsv"))
+```
+
+### Mosaic Extend to regions
+```{r mosaicSources, fig.width=7, fig.height=5}
+
+# Trio vars coding fraction
+exonicFraction <- (trioDNM_Vars |> filter(IMPACT != "MODIFIER") |> dim())[1]/dim(trioDNM_Vars)[1]
+exonicFraction
+
+tukExomes <- read_tsv(paste0( "<local_working_dir>/nanoSampleMeta/","targetedSamplesFiltered.tsv"), col_types = cols()) |> 
+  filter(nanoseq == "Exome") |> pull(Sample_PD_ID)
+
+# Fraction of path
+pathFractionExp <- read_tsv(paste0(localPath, "data/tukVafSumsExp.tsv"), col_types = cols()) |>
+  filter(Sample_PD_ID %in% tukExomes) |> 
+  group_by(vafGroup) |> summarize(vafSum = mean(vafSum))
+pathFractionExpInd <- read_tsv(paste0(path, "sperm/twinsUK/valsExpectedIndelTarg.tsv"), col_types = cols()) |> 
+  filter(Sample_PD_ID %in% tukExomes) |> 
+  group_by(vafGroup) |> summarize(vafSum = mean(vafSum))
+# Mean coding vafSum. Have for indel directly, SNVs can add up
+codingExp <- (pathFractionExp |> filter(vafGroup == "HIGH_vepCovered") |> pull(vafSum)) + 
+  (pathFractionExp |> filter(vafGroup == "missense_vepCovered") |> pull(vafSum)) + 
+  (pathFractionExp |> filter(vafGroup == "synonymous_vepCovered") |> pull(vafSum)) + 
+  (pathFractionExpInd |> filter(vafGroup == "coding_indel") |> pull(vafSum)) 
+# Mean pathogenic
+pathExp <- (pathFractionExp |> filter(vafGroup == "vepCoveredClinDDlofCADD") |> pull(vafSum)) + 
+  (pathFractionExpInd |> filter(vafGroup == "ClinDDlofCADD") |> pull(vafSum))
+
+pathFraction <- pathExp/codingExp
+pathFraction
+
+# Relative fractions for each region
+fractions <- tribble(
+  ~region,       ~mult,
+  "Genome", 1,
+  "Exome",       exonicFraction,
+  "Pathogenic",  exonicFraction*pathFraction
+  #"GermanPanel",        0.0002,
+  #"GermanPanelPath",   0.001 * 0.02
+)
+
+regions_overall_individual <- overall_individual |>
+  rename(base_ID = ID) |>  
+  crossing(fractions) |>
+  mutate(
+    ID = factor(region, levels = fractions$region),
+    class = "Exp",
+    n_variants            = n_variants * mult,
+    ci_low_n_variants     = ci_low_n_variants * mult,
+    ci_high_n_variants    = ci_high_n_variants * mult,
+    expected_transmitted  = expected_transmitted * mult,
+    ci_low_transmitted    = ci_low_transmitted * mult,
+    ci_high_transmitted   = ci_high_transmitted * mult) 
+
+pMosaicCount <- ggplot(regions_overall_individual, aes(x = ID, y = n_variants)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = ci_low_n_variants, ymax = ci_high_n_variants), width = 0.1) +
+  scale_y_log10() +
+  ylab("Number of 1%-30% VAF variants in sperm") +
+  theme_pubr() +
+  theme(axis.title.x = element_blank())
+
+pMosaicTransmitted <- ggplot(regions_overall_individual, aes(x = ID, y = expected_transmitted)) +
+  geom_point() +
+  geom_errorbar(
+    aes(ymin = ci_low_transmitted, ymax = ci_high_transmitted),
+    width = 0.1
+  ) +
+  scale_y_log10() +
+  ylab("Transmitted 1%–30% VAF variants as DNMs") +
+  theme_pubr() +
+  theme(axis.title.x = element_blank())
+
+pMosaicCount + pMosaicTransmitted
+
+```
+
+
+
+
+## e) Signatures
+Create file postNextflow/signatures/run_SigProfiler_Extractor.v1.8.py
+### Sigprofiler script
+```{python signatures, eval=FALSE}
+#!/usr/bin/env python
+import sys, argparse
+from SigProfilerExtractor import sigpro as sig
+
+parser = argparse.ArgumentParser()
+parser.add_argument("input", help="input matrix file or folder contating vcf files")
+parser.add_argument("-o", "--output", type=str, default="output_folder", help="output folder")
+parser.add_argument("-d", "--data_type", type=str, default="vcf")
+parser.add_argument("-r", "--reference", type=str, default="GRCh37")
+args = parser.parse_args()
+print(args)
+
+if __name__=="__main__":
+	sig.sigProfilerExtractor(args.data_type, args.output, args.input, cpu=8, gpu=True, reference_genome=args.reference, opportunity_genome=args.reference, minimum_signatures=1, maximum_signatures=10)
+
+```
+
+### Submit standard
+```{bash sigs, eval=FALSE}
+
+#Move VCFs to input folder
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/
+mkdir -p signatures
+cd signatures
+mkdir -p sigprofiler_in headerless jobLogs 
+mkdir -p sigprofiler_Aug25 sigprofiler_Aug25norm
+
+for sample in $(cut -f1 <hpc_scratch>/sperm/germanTrio_data/germanTrioSamplesFiltered.txt); do
+  echo $sample
+  if grep -q "$sample" <hpc_scratch>/sperm/germanTrio_data/postNextflow/vep/sigInput.vcf; then
+    grep "$sample" <hpc_scratch>/sperm/germanTrio_data/postNextflow/vep/sigInput.vcf > headerless/$sample.vcf
+    cat <hpc_scratch>/genomicRegions/vcfHeader_GRCh37d5.txt headerless/$sample.vcf > sigprofiler_in/$sample.vcf
+  fi
+done
+
+#Run signature extraction with no matrix normalization
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/signatures
+rm sigprofiler_in/input/*.vcf
+bsub -J sigprofiler_Aug25 -o jobLogs/sig.%J.out -e jobLogs/sig.%J.err -q gpu-normal -gpu - -R 'select[mem>=32000] rusage[mem=32000]' -M32000 "module load sigprofiler/extractor-1.1.24-GRCh38-GRCh37; python run_SigProfiler_Extractor.v1.8.py sigprofiler_in -o sigprofiler_Aug25"
+```
+
+### Matrix normalization 
+#### Create Count File
+``` {bash matrixNorm}
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/signatures/
+rm trinucCounts.tsv
+#Get trinucleotide counts for matrix normalization
+for sample in `cut -f1 <hpc_scratch>/sperm/germanTrio_data/germanTrioSamplesFiltered.txt`;
+  do  echo $sample
+  grep -v  'tri_bg' <hpc_scratch>/sperm/germanTrio_data/canAppsOutput/$sample/*.summary/$sample*.trint_counts_and_ratio2genome.tsv | sed "s/$/\t$sample/" >> trinucCounts.tsv
+done
+
+```
+
+#### Normalize matrix by nanoseq coverage
+```{r signaturesNormalize}
+
+#Read in trinuc counts and ratio to full genome
+backgroundRates <- read_tsv("<hpc_scratch>/sperm/germanTrio_data/postNextflow/signatures/trinucCounts.tsv", col_types = cols(), col_names = c("trinuc", "trinucCount", "ratio2genome", "Sample_PD_ID")) 
+  
+#Get mutation matrix generated by sigprofiler and then correct for ratio to genome
+matrixNorm <- read_tsv("<hpc_scratch>/sperm/germanTrio_data/postNextflow/signatures/sigprofiler_in/output/SBS/sigprofiler_in.SBS96.all", col_types = cols()) |> 
+  pivot_longer(cols = starts_with("PD"), names_to = "Sample_PD_ID", values_to = "mutCount") |> 
+  mutate(trinuc = paste0(str_sub(MutationType, 1,1), str_sub(MutationType, 3,3),str_sub(MutationType, 7,7))) |> 
+  left_join(backgroundRates, by = c("Sample_PD_ID", "trinuc")) |> 
+  mutate(normCount = round(mutCount * 1/ratio2genome)) |> 
+  select(MutationType, Sample_PD_ID,normCount) |> drop_na() |> 
+  pivot_wider(names_from = Sample_PD_ID, values_from = normCount) 
+
+write_tsv(matrixNorm, "<hpc_scratch>/sperm/germanTrio_data/postNextflow/signatures/sigprofiler_in/output/SBS/sigprofiler_in.SBS96.normalized", col_names = T)
+
+# Get normalized for all samples combined due to low mutation count per sample
+matrixNormCombined <- read_tsv("<hpc_scratch>/sperm/germanTrio_data/postNextflow/signatures/sigprofiler_in/output/SBS/sigprofiler_in.SBS96.all", col_types = cols())|> 
+  pivot_longer(cols = starts_with("PD"), names_to = "Sample_PD_ID", values_to = "mutCount") |> 
+  mutate(trinuc = paste0(str_sub(MutationType, 1,1), str_sub(MutationType, 3,3),str_sub(MutationType, 7,7))) |> 
+  left_join(backgroundRates, by = c("Sample_PD_ID", "trinuc")) |> 
+  mutate(normCount = mutCount * 1/ratio2genome) |> 
+  select(MutationType, Sample_PD_ID,normCount) |> drop_na() |> 
+  mutate(dataset = if_else(str_detect(Sample_PD_ID, "PD5"), "Oxford", "GermanTrio")) |> 
+  group_by(MutationType) |> 
+summarize(
+  Oxford = round(sum(normCount[dataset == "Oxford"], na.rm = TRUE)),
+  GermanTrio = round(sum(normCount[dataset == "GermanTrio"], na.rm = TRUE)),
+  .groups = "drop"
+)
+
+write_tsv(matrixNormCombined, "<hpc_scratch>/sperm/germanTrio_data/postNextflow/signatures/sigprofiler_in/output/SBS/sigprofiler_in.SBS96.normalized.combined", col_names = T)
+
+
+```
+
+#### Submit normalized
+```{bash sigs, eval=FALSE}
+# Per sample
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/signatures/
+bsub -J sigprofiler_Aug25norm -o jobLogs/sig.%J.out -e jobLogs/sig.%J.err -q gpu-normal -gpu - -R 'select[mem>=32000] rusage[mem=32000]' -M32000 "module load sigprofiler/extractor-1.1.24-GRCh38-GRCh37; python run_SigProfiler_Extractor.v1.8.py sigprofiler_in/output/SBS/sigprofiler_in.SBS96.normalized --data_type matrix -o sigprofiler_Aug25norm"
+
+# All samples
+cd <hpc_scratch>/sperm/germanTrio_data/postNextflow/signatures/
+bsub -J sigprofiler_Aug25normAll -o jobLogs/sig.%J.out -e jobLogs/sig.%J.err -q gpu-normal -gpu - -R 'select[mem>=32000] rusage[mem=32000]' -M32000 "module load sigprofiler/extractor-1.1.24-GRCh38-GRCh37; python run_SigProfiler_Extractor.v1.8.py sigprofiler_in/output/SBS/sigprofiler_in.SBS96.normalized.combined --data_type matrix -o sigprofiler_Aug25normAll"
+
+
+```
+
+#### Trinuc DNM counts
+```{r trinucDNMs}
+trinucDNMs <- read_tsv(paste0(path, "sperm/germanTrio_data/dnmData/trinucCountsDNMs.tsv"), col_types = cols()) |>
+  select(-c(PD67073b, PD64157a)) |>
+  rowwise() |>
+  mutate(dnmCount = sum(c_across(-MutationType))) |>
+  ungroup() |>
+  mutate(TRI = str_replace(MutationType, "([ACGT])\\[([ACGT])>([ACGT])\\]([ACGT])", "\\1\\2\\4>\\3")) |>
+  select(TRI, dnmCount)
+sum(trinucDNMs$dnmCount)
+
+write_tsv(trinucDNMs, paste0(localPath, "data/trinucDNMs.tsv"))
+```
+
+
+## f) TwinsUK model fits (for public code fallback)
+TwinsUK individual-level VAF sums (tukVafSums etc.) are under TwinsUK's controlled-access
+policy and can't be shared publicly (see README in PublicCode/). The age-trend models
+fitted on them are pure aggregate summaries (an Age grid + fitted value + 95% CI, or a
+handful of scalar stats) with no way to recover individual data points, so those are
+safe to export and let the public figures code draw the TwinsUK trend line/reported
+stats without needing the underlying samples.
+
+### Basic burdens
+```{r targBurden, fig.height=5, fig.width=8}
+ 
+burdenTwinsUKTarg <- read_tsv(paste0("<local_working_dir>/nanoseqTwinsUK_Targ/data/burdensFiltered.tsv"), col_types = cols()) |>
+  left_join(read_tsv(paste0("<local_working_dir>/nanoSampleMeta/targetedSamplesFiltered.tsv"), col_types = cols()), by = "Sample_PD_ID") |>
+  mutate(nanoseq = "Controls") |>
+  rename(Age = age_at_sampling) |> drop_na(Age)
+
+# TwinsUK burden data is individual-level and controlled-access (see the
+# "TwinsUK model fits" note in ## d) Observed VAFs). Save the age-trend fits
+# only (aggregate Age grid + fit + CI, using the same age_grid_fine/fit_lm_grid
+# helpers defined there) so the public figures code can draw the TwinsUK trend
+# line without the underlying samples.
+twinsUK_burdenFits <- bind_rows(
+  fit_lm_grid(lm(burdenCorr ~ Age, data = burdenTwinsUKTarg)) |> mutate(model = "burdenCorr"),
+  fit_lm_grid(lm(indelBurden ~ Age, data = burdenTwinsUKTarg)) |> mutate(model = "indelBurden")
+)
+write_tsv(twinsUK_burdenFits, paste0(localPath, "data/twinsUK_burdenFits.tsv"))
+
+burdenCombined <- germanTrioBurdens |>
+  mutate(burdenCorr = burdenCorr1percent, indelBurden = burdenIndelPost1percent) |> 
+  mutate(nanoseq = if_else(str_detect(Sample_PD_ID, "PD5"),"Apert fathers", "DD fathers")) |> 
+  bind_rows(burdenTwinsUKTarg) 
+
+p_germanTrioBurdens <- ggplot(burdenCombined, aes(x = Age, y = burdenCorr, fill = nanoseq)) + 
+  geom_point(size=3.5, pch=21, col='white', stroke=0.25) + 
+  geom_smooth(method = "lm") + 
+  scale_fill_manual(values = dataset_colours) +
+   theme(text = element_text(size=16)) + 
+  xlab('Age (years)') + 
+  ylab('Mutations per bp') + 
+  labs(fill='Dataset') + 
+  theme_minimal() + 
+  ylim(0,NA) 
+
+p_germanTrioBurdens
+
+p_indelBurden<- ggplot(burdenCombined, aes(x = Age, y = indelBurden, fill = nanoseq)) + 
+  geom_point(size=3.5, pch=21, col='white', stroke=0.25) + 
+  scale_alpha_manual(values = c(1, 1, 0.8), guide = "none") + 
+   theme(text = element_text(size=16)) + 
+  geom_smooth(method = "lm") + 
+  scale_fill_manual(values = dataset_colours) +
+  xlab('Age (years)') + 
+  ylab('Indels per bp') + 
+  labs(fill='Dataset') + 
+  theme_minimal() + 
+  ylim(0,NA) 
+
+p_indelBurden
+```
+
+### VafSums
+```{r twinsUKVafFits}
+# Wider than the observed TwinsUK age range so ages back-inferred to conception
+# (Age - paternalAgeGap) on the public side stay within the saved grid.
+age_grid_fine <- tibble(Age = seq(10, 80, by = 1))
+
+# Predict a model over the age grid with 95% CI - works for any simple lm(y ~ Age).
+# Linear interpolation between grid points reproduces predict() exactly for a
+# straight-line model, so this same grid also supports point predictions at
+# arbitrary (non-grid) ages downstream via approx().
+fit_lm_grid <- function(model, ages = age_grid_fine$Age) {
+  pred <- predict(model, newdata = tibble(Age = ages), se.fit = TRUE, interval = "confidence", level = 0.95)
+  tibble(Age = ages, fit = pred$fit[,"fit"], ci_lo = pred$fit[,"lwr"], ci_hi = pred$fit[,"upr"])
+}
+
+twins_model <- lm(exome_vafSum ~ Age, data = tukVafSums |> filter(vafGroup == "ClinDDlofCADD"))
+twins_model_panel <- lm(vafSum ~ Age, data = tukVafSums |> filter(vafGroup == "ClinDDlofCADD"))
+twins_model_driver <- lm(vafSum ~ Age, data = tukVafSums |> filter(vafGroup == "posPath"))
+model_exome_posPath <- tukVafSums |> filter(vafGroup == "posPath") |> lm(exome_vafSum ~ Age, data = _)
+
+# Quasibinomial smooth (used for the driver-rate panels) is not a simple lm, so the
+# grid is predicted on the link scale then back-transformed, matching what
+# stat_smooth(method = "glm", family = "quasibinomial") does internally.
+fitQB_allPos <- glm(vafSum ~ Age, family = quasibinomial, data = tukVafSums |> filter(vafGroup == "allPos"))
+predsQB <- predict(fitQB_allPos, newdata = age_grid_fine, type = "link", se.fit = TRUE)
+gridQB <- tibble(
+  Age = age_grid_fine$Age,
+  fit = plogis(predsQB$fit),
+  ci_lo = plogis(predsQB$fit - 1.96 * predsQB$se.fit),
+  ci_hi = plogis(predsQB$fit + 1.96 * predsQB$se.fit)
+) |> mutate(model = "vafSum_allPos_quasibinom")
+
+# Note: "ClinDDlofCADD" is the internal vafGroup label from generate_vaf_summary();
+# it's the same selection as what the public figures code calls "likelyDisease",
+# so the saved model names use that more readable label instead.
+twinsUK_vafFits <- bind_rows(
+  fit_lm_grid(twins_model) |> mutate(model = "exome_vafSum_likelyDisease"),
+  fit_lm_grid(twins_model_panel) |> mutate(model = "vafSum_likelyDisease"),
+  fit_lm_grid(twins_model_driver) |> mutate(model = "vafSum_posPath"),
+  fit_lm_grid(model_exome_posPath) |> mutate(model = "exome_vafSum_posPath"),
+  gridQB
+)
+write_tsv(twinsUK_vafFits, paste0(localPath, "data/twinsUK_vafFits.tsv"))
+
+# Exome-to-panel capture fraction: a single scalar plus reporting stats, all
+# aggregate (see "Calibrate exome correction" in the public/DD-father section
+# for how this constant is used).
+fractionWithinPanel <- tukVafSums |>
+  group_by(vafGroup) |>
+  summarize(totalVAFs = sum(vafSum, na.rm = TRUE), totalVAFsExome = sum(exome_vafSum, na.rm = TRUE), .groups = "drop") |>
+  mutate(percentageInPanel = totalVAFs / totalVAFsExome)
+exomePanelCorrection <- fractionWithinPanel |> filter(vafGroup == "ClinDDlofCADD") |> pull(percentageInPanel)
+
+panel_exome_df <- tukVafSums |>
+  filter(vafGroup == "ClinDDlofCADD") |>
+  mutate(percentageInPanel = vafSum / exome_vafSum) |>
+  filter(is.finite(percentageInPanel), percentageInPanel > 0)
+
+cor_test <- cor.test(panel_exome_df$vafSum, panel_exome_df$exome_vafSum, method = "pearson")
+fit_age <- lm(percentageInPanel ~ Age, data = panel_exome_df)
+fit_age_sum <- summary(fit_age)
+
+twinsUK_exomePanelCorrection_stats <- tibble(
+  exomePanelCorrection = exomePanelCorrection,
+  n_samples = nrow(panel_exome_df),
+  n_sources = dplyr::n_distinct(panel_exome_df$source),
+  cor_estimate = unname(cor_test$estimate),
+  cor_p_value = cor_test$p.value,
+  age_beta_per_year = coef(fit_age)["Age"],
+  age_se = coef(fit_age_sum)["Age", "Std. Error"],
+  age_p_value = coef(fit_age_sum)["Age", "Pr(>|t|)"],
+  age_r_squared = fit_age_sum$r.squared,
+  mean_frac = mean(panel_exome_df$percentageInPanel, na.rm = TRUE),
+  median_frac = median(panel_exome_df$percentageInPanel, na.rm = TRUE),
+  sd_frac = sd(panel_exome_df$percentageInPanel, na.rm = TRUE),
+  iqr_frac = IQR(panel_exome_df$percentageInPanel, na.rm = TRUE)
+)
+write_tsv(twinsUK_exomePanelCorrection_stats, paste0(localPath, "data/twinsUK_exomePanelCorrection_stats.tsv"))
+
+twinsUK_vafFits <- bind_rows(twinsUK_vafFits, fit_lm_grid(fit_age) |> mutate(model = "percentageInPanel_exomeCorrection"))
+write_tsv(twinsUK_vafFits, paste0(localPath, "data/twinsUK_vafFits.tsv"))
+```
+
+# 5. Supplementary Tables
+### SupTable 1: Overview
+```{r supTable1}
+
+trioIDs <- read_xlsx(paste0(metaPath, "Tables/controls_samplesEGA.xlsx"))
+
+id_lut <- setNames(trioIDs$Sanger_Sample_ID, trioIDs$Canapps_Sample_name)
+
+controlTrios <- read_tsv(paste0(metaPath, "Tables/metadata_14Apr2025_completefamilies_DNMs_counts-Jan2026.txt"), col_types = cols()) |>
+  mutate(Cohort = "ControlTrios") |>
+  mutate(sex = if_else(`sex(F=2,M=1)` == 1, "M", "F")) |>
+  mutate(FAM_ID = paste0("SFHS_", famid)) |>
+  rename(PD_ID = Sample, Pat_ID = father, Mat_ID = mother) |>
+  mutate(across(c(PD_ID, Pat_ID, Mat_ID), ~{ m <- id_lut[.x]; ifelse(is.na(m), .x, unname(m)) })) |>
+  rename(Pat_Age_at_birth = m_age, Mat_Age_at_birth = f_age)|> group_by(FAM_ID) |>
+  arrange(Pat_Age_at_birth, .by_group = TRUE) |>
+  mutate(FAM_ID = if (dplyr::n() > 1) paste0(FAM_ID, "_", dplyr::row_number()) else FAM_ID) |>
+  ungroup()
+
+sperm0 <- covSummaryTarg |>
+  mutate(SpermNanoseqData = T) |> 
+  mutate(SpermNanoseqFilter = if_else(sampleFilter == "FULL", "Pass", sampleFilter)) |> 
+  select(FAM_ID, Cohort, SpermNanoseqData, SpermNanoseqFilter)
+
+SupTable1_Overview <- read_tsv(paste0(metaPath, "Tables/metadata_DNMs_counts-Jan2026.txt"), col_types = cols()) |> 
+  mutate(Cohort = "DD fathers", FAM_ID = str_replace(FamID, "F", "FAM_")) |> 
+  filter(FAM_ID != "FAM_179") |> # Accidentally sent sister's blood and not index
+  bind_rows(controlTrios) |> 
+  mutate(TrioWGSdata = T) |> 
+  mutate(TrioWGSfilter = if_else(PD_ID == "PD64157a" & Cohort == "DD fathers", "QCfail_metadata", "Pass")) |> 
+  arrange(FAM_ID) |> 
+  select(FAM_ID, Cohort, TrioWGSdata, TrioWGSfilter) |> 
+  full_join(sperm0, by = join_by(FAM_ID, Cohort)) |> 
+  arrange(FAM_ID) |> 
+  mutate(TrioWGSdata = coalesce(TrioWGSdata, F)) |> 
+  mutate(SpermNanoseqData = coalesce(SpermNanoseqData, F))
+
+write_tsv(SupTable1_Overview, paste0(manuscriptPath, "SupTables/SupTable1_Overview.tsv"))
+
+```
+
+### SupTable 3: Trios
+```{r supTable3}
+
+SupTable3_Trios <- read_tsv(paste0(metaPath, "Tables/metadata_DNMs_counts-Jan2026.txt"), col_types = cols()) |> 
+  mutate(Cohort = "DD fathers", FAM_ID = str_replace(FamID, "F", "FAM_")) |> 
+  filter(FAM_ID != "FAM_179") |> # Accidentally sent sister's blood and not index
+  filter(PD_ID != "PD64157a") |> # Removed for QC
+  bind_rows(controlTrios) |> 
+  mutate(Age = as.integer(Age)) |> suppressWarnings() |> 
+  arrange(FamID) |> 
+  select(FAM_ID, Cohort, 
+         Pat_age_at_birth = Pat_Age_at_birth, Mat_age_at_birth = Mat_Age_at_birth, 
+         Proband_median_cov = MEDIAN_COVERAGE, Pat_median_cov = Pat_seq_x, Mat_median_cov = Mat_seq_x, 
+         SNP_DNMs_0.3VAF, Indel_DNMs_0.3VAF, DNM_0.3_medianVAF = sample.median.0.3vaf, SBS1, SBS5,
+         PD_ID_Proband = PD_ID, PD_ID_Pat = Pat_ID, PD_ID_Mat = Mat_ID)
+
+write_tsv(SupTable3_Trios, paste0(manuscriptPath, "SupTables/SupTable3_Trios.tsv"))
+
+```
+
+### SupTable 2: DNM calls
+```{r supTable2}
+
+trioDNMPhase <- read_tsv(paste0(path, "sperm/germanTrio_data/dnmData/All_PhaseMyDeNovo_output_0.3VAF.txt"), col_types = cols()) |>
+  filter(id != "id") |>
+  select(PD_ID = id, chr = chrom, start = pos, ref, alt, phase = `phase...14`) |>
+  mutate(start = as.numeric(start))
+
+SupTable2_DNMs <- read_tsv(paste0(metaPath, "trioDNM_Vars.tsv"), col_types = cols())|>
+  left_join(trioDNMPhase, by = join_by(chr, start, ref, alt, PD_ID)) |>
+  mutate(phase = coalesce(phase, "unknown")) |>
+  mutate(phase = if_else(phase == "F,M", "unknown", phase)) |>
+  left_join(SupTable3_Trios |> select(FAM_ID, PD_ID = PD_ID_Proband), by = join_by(PD_ID, FAM_ID)) |>
+  select(chr, start_hg19 = start, ref, alt, FAM_ID, PD_ID_Proband = PD_ID, Cohort, phase, VEP_csq = csq, VEP_IMPACT = IMPACT, gene, gnomADe_AF, cadd,
+         ClinVar_CLNDN = PHEN, ClinVar_CLNSIG = CLNSIG, ClinVar_CLNSIGCONF = CLNSIGCONF, likelyDisease, likelyDriver) |>
+  arrange(FAM_ID, chr, start_hg19) |>
+  distinct()
+
+write_tsv(SupTable2_DNMs, paste0(manuscriptPath, "SupTables/SupTable2_DNMs.tsv"))
+```
+
+### SupTable 6: Sperm Samples
+```{r supTable6}
+SupTable6_SpermSamples <- read_tsv(paste0(metaPath,"germanTrioSamplesFiltered.tsv"), col_types = cols()) |> 
+  mutate(Tissue = "Semen") |> 
+  mutate(Cohort = if_else(str_detect(Sample_PD_ID, "PD6"), "DD fathers", "Apert fathers")) |> 
+  left_join(read_tsv(paste0(localPath, "data/germanTrioBurdens.tsv"), col_types = cols()), by = join_by(Sample_PD_ID)) |> 
+  select(PD_ID, FAM_ID, Cohort, Tissue, Age, total_duplex_bp_cov = total, 
+         snvs = muts, snv_burden = burden, snv_burden_corr = burdenCorr, snv_burden_corr_0.01vaf = burdenCorr1percent, 
+         indels, indel_burden = indelBurden, indel_burden_0.01vaf = burdenIndelPost1percent)
+
+write_tsv(SupTable6_SpermSamples, paste0(manuscriptPath, "SupTables/SupTable6_SpermSamples.tsv"))
+
+```
+
+### SupTable 4: Diag DNMs
+```{r supTable4}
+
+SupTable4_DiagDNMs <- read_tsv(paste0(metaPath, "diagnosticVarsPos.txt"), col_types = cols()) |>
+  distinct() |>
+  filter(FAM_ID %in% SupTable1_Overview$FAM_ID | FAM_ID %in% SupTable6_SpermSamples$FAM_ID | Cohort == "Apert fathers") |>
+  rename(inDNMcallSet = called_TrioWGS, reasonNotInDNMcallSet = missing_TrioWGS) |>
+  mutate(reasonNotInDNMcallSet = if_else(is.na(inDNMcallSet), "No Trio WGS data", reasonNotInDNMcallSet)) |>
+  left_join(read_xlsx(paste0(metaPath, "SupTable4_DiagDNM_SoNs.xlsx"), sheet = 1) |> select(VAR_ID, ANALYSIS_PERFORMED)|>
+  separate_rows(VAR_ID, sep = ",\\s*") |> drop_na(VAR_ID), by = join_by(VAR_ID)) |>
+  mutate(ANALYSIS_PERFORMED = if_else(Cohort == "Apert fathers", "Apert ascertained", ANALYSIS_PERFORMED)) |>
+  mutate(ANALYSIS_PERFORMED = if_else(gene == "SCN1A" & !FAM_ID %in% c("FAM_050", "FAM_087", "FAM_091", "FAM_144"), "SCN1A ascertained", ANALYSIS_PERFORMED)) |>
+  mutate(patSpermSequenced = if_else(FAM_ID %in% SupTable6_SpermSamples$FAM_ID, "Yes", "No")) |>
+    left_join(read_tsv(paste0(localPath, "data/diagnosticVarsCalls.tsv"), col_types = cols()) |>
+              filter(group == "Target") |>
+              select(VAR_ID, FAM_ID, sperm_duplexCalls = duplexCalls, sperm_duplexCov = duplexCov, sperm_duplexVAF = duplexVAF,
+                     sperm_BAM_calls = BAMcalls, sperm_BAM_cov = BAM_COV, sperm_BAM_VAF = BAM_VAF),
+            by = join_by(VAR_ID, FAM_ID))
+
+write_tsv(SupTable4_DiagDNMs, paste0(manuscriptPath, "SupTables/SupTable4_DiagDNMs.tsv"))
+
+write.xlsx(SupTable4_DiagDNMs |> filter(Cohort == "DD fathers"), paste0(manuscriptPath, "SupTables/SupTable4_DiagDNMs.xlsx"))
+table(SupTable4_DiagDNMs$reasonNotInDNMcallSet)
+
+```
+
+### SupTable 5: Clinical Review
+```{r supTable5}
+
+SupTable5_ClinicalReview <- read_csv(paste0(metaPath, "Tables/JoeClinicalReview3.0.csv"), col_types = cols()) |> 
+  filter(!Group %in% c("Diagnostic variant", "Diagnostic variant (Uncalled)", "No known  clinical phenotype", "Unlikely  clinical relevance")) |> 
+  mutate(across(`Variant classification`:Comments, ~replace_na(.x, "N/A")))
+table(SupTable5_ClinicalReview$Group)
+
+write_tsv(SupTable5_ClinicalReview, paste0(manuscriptPath, "SupTables/SupTable5_ClinicalReview.tsv"))
+
+```
+
+
+
+### SupTable 7: Target Panels
+```{r supTable6}
+SupTable7_TargetPanels <- read_tsv("<local_working_dir>/genePanel/GermlinePanelV2/germlineV2_hg19.bed", col_types = 'cii--', col_names= c("chr", "start_hg19", "end_hg19")) |> mutate(DD_fathersPanel = T) |> 
+  full_join(read_tsv("<local_working_dir>/genePanel/GermlinePanelV1/germlineV1_hg19.bed", col_types = 'cii--', col_names= c("chr", "start_hg19", "end_hg19")) |> mutate(Apert_fathersPanel = T)) |> 
+  arrange(chr, start_hg19) |> 
+  mutate(DD_fathersPanel = coalesce(DD_fathersPanel, FALSE),
+    Apert_fathersPanel = coalesce(Apert_fathersPanel, FALSE))
+  
+write_tsv(SupTable7_TargetPanels, paste0(manuscriptPath, "SupTables/SupTable7_TargetPanels.tsv"))
+
+```
+
+### SupTable 8: Sperm Vars
+```{r supTable8}
+SupTable8_SpermVars <- read_tsv(paste0(localPath, "data/germanTrioTargVars.tsv"), col_types = cols()) |> 
+  mutate(Cohort = if_else(str_detect(Sample_PD_ID, "PD6"), "DD fathers", "Apert fathers")) |> 
+  select(chr, start_hg19 = start, ref, alt, TRI, TYPE, DUPLEX_MUT = TIMES_CALLED, DUPLEX_COV, DUPLEX_VAF,
+         BAM_MUT, BAM_COV, BAM_VAF, PD_ID, Age, FAM_ID, Cohort, gene, VEP_csq = csq, VEP_IMPACT = IMPACT, gnomADe_AF, cadd,
+         ClinVar_CLNDN = PHEN, ClinVar_CLNSIG = CLNSIG, ClinVar_CLNSIGCONF = CLNSIGCONF, likelyDisease, likelyDriver)
+
+write_tsv(SupTable8_SpermVars, paste0(manuscriptPath, "SupTables/SupTable8_SpermVars.tsv")) 
+
+```
+
+### SupTable 9: dNdS gene level
+```{r supTable9}
+SupTable9_dNdSgeneLevel <- read_tsv(paste0(localPath, "data/SupTable_sig_dndsAll.tsv"), col_types = cols())
+write_tsv(SupTable9_dNdSgeneLevel, paste0(manuscriptPath, "SupTables/SupTable9_dNdSgeneLevel.tsv"))
+
+```
+
+### SupTable 10: dNdS hotspot
+```{r supTable10}
+SupTable10_dNdShotspot <- read_tsv(paste0(localPath, "data/siteHotspots_dndsBP_all.tsv"), col_types = cols())
+  
+write_tsv(SupTable10_dNdShotspot, paste0(manuscriptPath, "SupTables/SupTable10_dNdShotspot.tsv"))
+
+```
+
+
+
+#### Combined xlsx
+Run this to rewrite all to excel at once
+```{r supTables}
+supTables <- createWorkbook()
+
+# Add each table as a new sheet
+addWorksheet(supTables, "Table S1 Overview")
+writeData(supTables, "Table S1 Overview", SupTable1_Overview)
+
+addWorksheet(supTables, "Table S2 DNMs")
+writeData(supTables, "Table S2 DNMs", SupTable2_DNMs)
+
+addWorksheet(supTables, "Table S3 Trios")
+writeData(supTables, "Table S3 Trios", SupTable3_Trios)
+
+addWorksheet(supTables, "Table S4 DiagDNMs")
+writeData(supTables, "Table S4 DiagDNMs", SupTable4_DiagDNMs)
+
+addWorksheet(supTables, "Table S5 ClinicalReview")
+writeData(supTables, "Table S5 ClinicalReview", SupTable5_ClinicalReview)
+
+addWorksheet(supTables, "Table S6 SpermSamples")
+writeData(supTables, "Table S6 SpermSamples", SupTable6_SpermSamples)
+
+addWorksheet(supTables, "Table S7 TargetPanels")
+writeData(supTables, "Table S7 TargetPanels", SupTable7_TargetPanels)
+
+addWorksheet(supTables, "Table S8 SpermVars")
+writeData(supTables, "Table S8 SpermVars", SupTable8_SpermVars)
+
+addWorksheet(supTables, "Table S9 dNdSgeneLevel")
+writeData(supTables, "Table S9 dNdSgeneLevel", SupTable9_dNdSgeneLevel)
+
+addWorksheet(supTables, "Table S10 dNdShotspot")
+writeData(supTables, "Table S10 dNdShotspot", SupTable10_dNdShotspot)
+
+# Save the combined workbook
+saveWorkbook(supTables, paste0(manuscriptPath, "Supplementary_Tables.xlsx"), overwrite = TRUE)
+
+# Save each table as an individual xlsx file
+write.xlsx(list("Table S1 Overview"       = SupTable1_Overview),       paste0(manuscriptPath, "SupTables/TableS1.xlsx"), overwrite = TRUE)
+write.xlsx(list("Table S2 DNMs"           = SupTable2_DNMs),           paste0(manuscriptPath, "SupTables/TableS2.xlsx"), overwrite = TRUE)
+write.xlsx(list("Table S3 Trios"          = SupTable3_Trios),          paste0(manuscriptPath, "SupTables/TableS3.xlsx"), overwrite = TRUE)
+write.xlsx(list("Table S4 DiagDNMs"       = SupTable4_DiagDNMs),       paste0(manuscriptPath, "SupTables/TableS4.xlsx"), overwrite = TRUE)
+write.xlsx(list("Table S5 ClinicalReview" = SupTable5_ClinicalReview), paste0(manuscriptPath, "SupTables/TableS5.xlsx"), overwrite = TRUE)
+write.xlsx(list("Table S6 SpermSamples"   = SupTable6_SpermSamples),   paste0(manuscriptPath, "SupTables/TableS6.xlsx"), overwrite = TRUE)
+write.xlsx(list("Table S7 TargetPanels"   = SupTable7_TargetPanels),   paste0(manuscriptPath, "SupTables/TableS7.xlsx"), overwrite = TRUE)
+write.xlsx(list("Table S8 SpermVars"      = SupTable8_SpermVars),      paste0(manuscriptPath, "SupTables/TableS8.xlsx"), overwrite = TRUE)
+write.xlsx(list("Table S9 dNdSgeneLevel"  = SupTable9_dNdSgeneLevel),  paste0(manuscriptPath, "SupTables/TableS9.xlsx"), overwrite = TRUE)
+write.xlsx(list("Table S10 dNdShotspot"   = SupTable10_dNdShotspot),   paste0(manuscriptPath, "SupTables/TableS10.xlsx"), overwrite = TRUE)
+```
