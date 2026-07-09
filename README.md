@@ -38,3 +38,5 @@ Whole genome sequencing data have been deposited at the European Genome-Phenome 
 ## License
 
 See [LICENSE](LICENSE).
+
+Exception: data/GraphicFig1a.png and data/GraphicFig4a_purple.png are schematic illustrations created with BioRender.com and are excluded from the repository's MIT license. They remain © BioRender and are included here solely so that DDfathers_figures.Rmd can reproduce the published figure panels - they are not licensed for reuse, modification, or redistribution.
