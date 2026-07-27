@@ -1150,13 +1150,13 @@ p_varFiltersDD / p_varFiltersApert + plot_annotation(tag_levels = "A")  &
   theme(plot.tag = element_text(size = 14, face = "bold"))
 
 
-png(paste0(manuscriptPath, 'Figures/SupFig1_varFilters.png'), height=7, width=9, res = 300, units = "in")
-p_varFiltersDD / p_varFiltersApert + plot_annotation(tag_levels = "A")  &
+png(paste0(manuscriptPath, 'Figures/SupFig1_varFilters.png'), height=4, width=9, res = 300, units = "in")
+p_varFiltersDD &
   theme(plot.tag = element_text(size = 14, face = "bold"))
 dev.off()
 
-pdf(paste0(manuscriptPath, 'Figures/SupFig1_varFilters.pdf'), height=7, width=9, onefile = F)
-p_varFiltersDD / p_varFiltersApert + plot_annotation(tag_levels = "A")  &
+pdf(paste0(manuscriptPath, 'Figures/SupFig1_varFilters.pdf'), height=4, width=9, onefile = F)
+p_varFiltersDD &
   theme(plot.tag = element_text(size = 14, face = "bold"))
 dev.off()
 

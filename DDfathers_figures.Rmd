@@ -2834,7 +2834,7 @@ ggplot(conception_comp_110, aes(x = group, y = vafProp, fill = vafType)) +
 ```
 
 ##### SupFig 5
-```{r scn1a_supfig5, fig.height=5, fig.width=17}
+```{r scn1a_supfig5, fig.height=5, fig.width=12}
 
 conception_comp_110_plot <- conception_comp_110 |>
   mutate(source_label = str_replace(group, "At sampling",   "DD fathers\nat sampling") |>
@@ -2844,7 +2844,7 @@ conception_comp_110_plot <- conception_comp_110 |>
 
 p_vafFractionConception_110 <- p_vafFractionConception %+% conception_comp_110_plot
 
-supfig5_110 <- pVafSumLikelyDisease + pExomeToPanelFraction + p_vafFractionConception_110 +
+supfig5_110 <- pVafSumLikelyDisease + pExomeToPanelFraction +
   plot_annotation(tag_levels = "A") &
   theme(plot.tag = element_text(size = 14, face = "bold"))
 
@@ -2852,7 +2852,7 @@ supfig5_110
 
 supfig5_110
 pdf(paste0(outputPath, "SupFig5_Path_nonSCN1A.pdf"),
-    height = 5, width = 17, onefile = FALSE)
+    height = 5, width = 12, onefile = FALSE)
 supfig5_110
 dev.off()
 ```
